@@ -4,7 +4,12 @@ from typing import Any, overload
 import numpy as np
 import xarray as xr
 
-from xarray_regrid.methods import conservative, flox_reduce, interp
+from xarray_regrid.methods import (
+    conservative,
+    conservative_polygon,
+    flox_reduce,
+    interp,
+)
 from xarray_regrid.utils import format_for_regrid
 
 
@@ -17,7 +22,9 @@ class Regridder:
         linear: linear, bilinear, or higher dimensional linear interpolation
         nearest: nearest-neighbor regridding
         cubic: cubic spline regridding
-        conservative: conservative regridding
+        conservative: axis-factored conservative regridding (rectilinear only)
+        conservative_polygon: polygon-intersection conservative regridding,
+            including curvilinear grids (requires shapely)
         most_common: most common value regridder
         stat: area statistics regridder
     """
@@ -81,6 +88,59 @@ class Regridder:
         ds_target_grid = validate_input(self._obj, ds_target_grid, time_dim)
         ds_formatted = format_for_regrid(self._obj, ds_target_grid)
         return interp.interp_regrid(ds_formatted, ds_target_grid, "cubic")
+
+    def conservative_polygon(
+        self,
+        ds_target_grid: xr.Dataset,
+        x_coord: str = "longitude",
+        y_coord: str = "latitude",
+        time_dim: str | None = "time",
+        skipna: bool = True,
+        nan_threshold: float = 1.0,
+        n_threads: int | None = None,
+    ) -> xr.DataArray | xr.Dataset:
+        """Polygon-intersection conservative regrid (planar geometry only).
+
+        Unlike ``.conservative``, this path handles curvilinear grids whose
+        x/y coordinates are 2D arrays. Planar only: users on global lat/lon
+        grids should expect small area errors near the poles and across the
+        antimeridian. Requires ``shapely >= 2.0``.
+
+        Args:
+            ds_target_grid: Dataset defining the target grid; must expose
+                ``x_coord`` and ``y_coord`` as coordinate variables.
+            x_coord: Name of the x (longitude-like) coordinate variable.
+            y_coord: Name of the y (latitude-like) coordinate variable.
+            time_dim: Name of the time dimension. Defaults to ``"time"``. Use
+                ``None`` to force regridding over the time dimension.
+            skipna: If True, propagate NaNs into the weighted mean via a
+                two-pass sum.
+            nan_threshold: Keep output cells whose valid source fraction is at
+                least ``nan_threshold``.
+            n_threads: Thread count for parallel GEOS intersection. ``None``
+                auto-selects; set to ``1`` to disable threading.
+
+        Returns:
+            Data regridded to the target grid.
+        """
+        if not 0.0 <= nan_threshold <= 1.0:
+            msg = "nan_threshold must be between [0, 1]"
+            raise ValueError(msg)
+
+        # Drop the time dim from the target if it slipped in, but skip the
+        # shared dim-match check: the curvilinear target's spatial dims need
+        # not share names with the source — they're matched by coord values.
+        if time_dim is not None and time_dim in ds_target_grid.coords:
+            ds_target_grid = ds_target_grid.isel({time_dim: 0}).reset_coords()
+        return conservative_polygon.polygon_conservative_regrid(
+            self._obj,
+            ds_target_grid,
+            x_coord=x_coord,
+            y_coord=y_coord,
+            skipna=skipna,
+            nan_threshold=nan_threshold,
+            n_threads=n_threads,
+        )
 
     def conservative(
         self,

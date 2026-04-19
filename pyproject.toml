@@ -44,6 +44,9 @@ accel = [
   "opt-einsum",
   "dask[distributed]",
 ]
+polygon = [
+  "shapely>=2.0",
+]
 benchmarking = [
   "matplotlib",
   "zarr",
@@ -74,7 +77,7 @@ docs = [  # Required for ReadTheDocs
 path = "src/xarray_regrid/__init__.py"
 
 [tool.hatch.envs.default]
-features = ["accel", "dev", "benchmarking"]
+features = ["accel", "dev", "benchmarking", "polygon"]
 
 [tool.hatch.envs.default.scripts]
 lint = [
