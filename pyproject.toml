@@ -46,6 +46,8 @@ accel = [
 ]
 polygon = [
   "shapely>=2.0",
+  # Needed by ConservativeRegridder.to_netcdf / from_netcdf (group support).
+  "h5netcdf",
 ]
 benchmarking = [
   "matplotlib",

@@ -94,23 +94,28 @@ class Regridder:
         ds_target_grid: xr.Dataset,
         x_coord: str = "longitude",
         y_coord: str = "latitude",
+        spherical: bool = False,
         time_dim: str | None = "time",
         skipna: bool = True,
         nan_threshold: float = 1.0,
         n_threads: int | None = None,
     ) -> xr.DataArray | xr.Dataset:
-        """Polygon-intersection conservative regrid (planar geometry only).
+        """Polygon-intersection conservative regrid.
 
         Unlike ``.conservative``, this path handles curvilinear grids whose
-        x/y coordinates are 2D arrays. Planar only: users on global lat/lon
-        grids should expect small area errors near the poles and across the
-        antimeridian. Requires ``shapely >= 2.0``.
+        x/y coordinates are 2D arrays. Defaults to planar geometry; set
+        ``spherical=True`` for lat/lon grids in degrees to get proper
+        spherical area weights via a cylindrical equal-area projection.
+        Requires ``shapely >= 2.0``.
 
         Args:
             ds_target_grid: Dataset defining the target grid; must expose
                 ``x_coord`` and ``y_coord`` as coordinate variables.
             x_coord: Name of the x (longitude-like) coordinate variable.
             y_coord: Name of the y (latitude-like) coordinate variable.
+            spherical: If True, assume coords are longitude/latitude in
+                degrees and apply a Lambert cylindrical equal-area projection
+                before intersecting. Rectilinear (1D coord) grids only.
             time_dim: Name of the time dimension. Defaults to ``"time"``. Use
                 ``None`` to force regridding over the time dimension.
             skipna: If True, propagate NaNs into the weighted mean via a
@@ -127,9 +132,8 @@ class Regridder:
             msg = "nan_threshold must be between [0, 1]"
             raise ValueError(msg)
 
-        # Drop the time dim from the target if it slipped in, but skip the
-        # shared dim-match check: the curvilinear target's spatial dims need
-        # not share names with the source — they're matched by coord values.
+        # Skip validate_input's dim-match check: curvilinear targets are
+        # matched by coord values, not by dim name.
         if time_dim is not None and time_dim in ds_target_grid.coords:
             ds_target_grid = ds_target_grid.isel({time_dim: 0}).reset_coords()
         return conservative_polygon.polygon_conservative_regrid(
@@ -137,6 +141,7 @@ class Regridder:
             ds_target_grid,
             x_coord=x_coord,
             y_coord=y_coord,
+            spherical=spherical,
             skipna=skipna,
             nan_threshold=nan_threshold,
             n_threads=n_threads,
