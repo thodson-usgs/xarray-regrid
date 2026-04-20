@@ -136,12 +136,12 @@ def test_regridder_weight_cache():
     da = _rect_da()
     target = _rect_target()
     regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
-    assert regridder._fwd_weights is None
+    assert regridder._fwd.weights is None
     regridder.regrid(da)
-    w1 = regridder._fwd_weights
+    w1 = regridder._fwd.weights
     assert w1 is not None
     regridder.regrid(da)
-    assert regridder._fwd_weights is w1  # same object, not rebuilt
+    assert regridder._fwd.weights is w1  # same object, not rebuilt
 
 
 def test_regridder_transpose_roundtrip_rectilinear_aligned():

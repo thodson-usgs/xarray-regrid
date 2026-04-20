@@ -158,6 +158,21 @@ def _check_shapely() -> None:
         raise ImportError(SHAPELY_IMPORT_ERROR)
 
 
+@dataclass
+class _DirectionCache:
+    """Lazy derivatives of an intersection-area matrix for one regrid direction.
+
+    All three fields are functions of ``_areas`` (forward) or of the transposed
+    ``_areas`` (backward), so they're kept together. Populated on first access
+    by the corresponding ``ConservativeRegridder`` accessor; swapped as a unit
+    by :meth:`ConservativeRegridder.transpose`.
+    """
+
+    weights: "sparse.COO | np.ndarray | None" = None  # row-normalized (n_dst, n_src)
+    apply: "sparse.COO | np.ndarray | None" = None    # transposed + sorted, for matmul
+    coverage: np.ndarray | None = None                 # bool (n_dst,) — any source overlap
+
+
 class ConservativeRegridder:
     """Reusable conservative regridder for grids that aren't 1D-separable.
 
@@ -217,50 +232,36 @@ class ConservativeRegridder:
         )
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
-        # `_*_apply` caches the transposed, index-sorted weight matrix used for
-        # `data @ W` matmul — avoiding sparse's per-call `.T` + `_sort_indices`.
-        self._fwd_weights: "sparse.COO | np.ndarray | None" = None
-        self._bwd_weights: "sparse.COO | np.ndarray | None" = None
-        self._fwd_apply: "sparse.COO | np.ndarray | None" = None
-        self._bwd_apply: "sparse.COO | np.ndarray | None" = None
-        self._fwd_coverage: np.ndarray | None = None
-        self._bwd_coverage: np.ndarray | None = None
+        self._fwd = _DirectionCache()
+        self._bwd = _DirectionCache()
 
     @property
     def forward_weights(self) -> "sparse.COO | np.ndarray":
         """The row-normalized forward weight matrix (source → target)."""
-        if self._fwd_weights is None:
-            self._fwd_weights = _row_normalize(self._areas)
-        return self._fwd_weights
+        if self._fwd.weights is None:
+            self._fwd.weights = _row_normalize(self._areas)
+        return self._fwd.weights
 
     @property
     def backward_weights(self) -> "sparse.COO | np.ndarray":
         """The row-normalized backward weight matrix (target → source)."""
-        if self._bwd_weights is None:
-            self._bwd_weights = _row_normalize(_transpose_weights(self._areas))
-        return self._bwd_weights
+        if self._bwd.weights is None:
+            self._bwd.weights = _row_normalize(_transpose_weights(self._areas))
+        return self._bwd.weights
 
-    def _forward_apply_matrix(self) -> "sparse.COO | np.ndarray":
-        if self._fwd_apply is None:
-            self._fwd_apply = _transpose_weights(self.forward_weights, sort=True)
-        return self._fwd_apply
+    def _apply_matrix(self, cache: _DirectionCache, weights: "sparse.COO | np.ndarray") -> "sparse.COO | np.ndarray":
+        """The transposed, index-sorted weight matrix used for ``data @ W``
+        matmul — avoiding sparse's per-call ``.T`` + ``_sort_indices``."""
+        if cache.apply is None:
+            cache.apply = _transpose_weights(weights, sort=True)
+        return cache.apply
 
-    def _backward_apply_matrix(self) -> "sparse.COO | np.ndarray":
-        if self._bwd_apply is None:
-            self._bwd_apply = _transpose_weights(self.backward_weights, sort=True)
-        return self._bwd_apply
-
-    def _forward_coverage(self) -> np.ndarray:
-        """Boolean (n_dst,) mask: which destination cells have any source
-        overlap. Lazily computed and cached alongside the forward weights."""
-        if self._fwd_coverage is None:
-            self._fwd_coverage = _coverage_mask(self._areas)
-        return self._fwd_coverage
-
-    def _backward_coverage(self) -> np.ndarray:
-        if self._bwd_coverage is None:
-            self._bwd_coverage = _coverage_mask(_transpose_weights(self._areas))
-        return self._bwd_coverage
+    def _coverage_for(self, cache: _DirectionCache, areas: "sparse.COO | np.ndarray") -> np.ndarray:
+        """Boolean ``(n_dst,)`` mask: which destination cells have any source
+        overlap. Uncovered cells produce NaN at apply time."""
+        if cache.coverage is None:
+            cache.coverage = _coverage_mask(areas)
+        return cache.coverage
 
     def regrid(
         self,
@@ -271,8 +272,8 @@ class ConservativeRegridder:
         """Regrid ``data`` forward (source → target)."""
         return _apply_stored_weights(
             data,
-            apply_weights=self._forward_apply_matrix(),
-            coverage=self._forward_coverage(),
+            apply_weights=self._apply_matrix(self._fwd, self.forward_weights),
+            coverage=self._coverage_for(self._fwd, self._areas),
             src_dims=self._src_dims,
             dst_dims=self._dst_dims,
             src_shape=self._src_shape,
@@ -306,12 +307,9 @@ class ConservativeRegridder:
         new._areas = _transpose_weights(self._areas)
         new._source_coords = self._target_coords
         new._target_coords = self._source_coords
-        new._fwd_weights = self._bwd_weights
-        new._bwd_weights = self._fwd_weights
-        new._fwd_apply = self._bwd_apply
-        new._bwd_apply = self._fwd_apply
-        new._fwd_coverage = self._bwd_coverage
-        new._bwd_coverage = self._fwd_coverage
+        # Forward on the transposed regridder is backward on the original.
+        new._fwd = self._bwd
+        new._bwd = self._fwd
         return new
 
     @property
@@ -457,12 +455,8 @@ class ConservativeRegridder:
         instance._areas = areas
         instance._source_coords = source_coords
         instance._target_coords = target_coords
-        instance._fwd_weights = None
-        instance._bwd_weights = None
-        instance._fwd_apply = None
-        instance._bwd_apply = None
-        instance._fwd_coverage = None
-        instance._bwd_coverage = None
+        instance._fwd = _DirectionCache()
+        instance._bwd = _DirectionCache()
         return instance
 
     @classmethod
