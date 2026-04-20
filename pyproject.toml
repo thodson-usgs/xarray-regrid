@@ -44,7 +44,7 @@ accel = [
   "opt-einsum",
   "dask[distributed]",
 ]
-conservative_2d = [
+conservative-2d = [
   # For conservative regridding on grids that aren't 1D-separable
   # (curvilinear, unstructured). Uses shapely for 2D polygon intersection.
   "shapely>=2.0",
@@ -81,7 +81,7 @@ docs = [  # Required for ReadTheDocs
 path = "src/xarray_regrid/__init__.py"
 
 [tool.hatch.envs.default]
-features = ["accel", "dev", "benchmarking", "conservative_2d"]
+features = ["accel", "dev", "benchmarking", "conservative-2d"]
 
 [tool.hatch.envs.default.scripts]
 lint = [
