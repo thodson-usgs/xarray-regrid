@@ -10,8 +10,8 @@ from xarray_regrid.utils import Grid, create_regridding_dataset
 __all__ = [
     "ConservativeRegridder",
     "Grid",
-    "RegridderMetadata",
     "Regridder",
+    "RegridderMetadata",
     "create_regridding_dataset",
     "methods",
     "polygons_from_coords",

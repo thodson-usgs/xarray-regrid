@@ -192,3 +192,14 @@ warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 exclude = ["tests/*", "docs"]
+
+# shapely and sparse are untyped; the conservative_2d module bridges to them,
+# so treating every signature that mentions sparse.COO as an error is noise.
+[[tool.mypy.overrides]]
+module = "xarray_regrid.methods.conservative_2d"
+disallow_any_unimported = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["shapely", "shapely.*", "sparse"]
+ignore_missing_imports = true

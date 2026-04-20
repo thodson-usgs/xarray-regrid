@@ -24,20 +24,22 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import cache
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import xarray as xr
 
+NetcdfEngine = Literal["netcdf4", "scipy", "h5netcdf"] | None
+
 
 @cache
 def _package_version() -> str:
-    """Cached ``importlib.metadata`` lookup. Cheap on warm call."""
+    """Cached ``importlib.metadata`` lookup."""
     try:
-        from importlib.metadata import version
         return version("xarray-regrid")
-    except Exception:
+    except PackageNotFoundError:
         return "unknown"
 
 
@@ -79,8 +81,10 @@ class RegridderMetadata:
         d["src_shape"] = list(d["src_shape"])
         d["dst_shape"] = list(d["dst_shape"])
         for key in (
-            "source_x_range", "source_y_range",
-            "target_x_range", "target_y_range",
+            "source_x_range",
+            "source_y_range",
+            "target_x_range",
+            "target_y_range",
         ):
             if d[key] is None:
                 del d[key]
@@ -91,6 +95,7 @@ class RegridderMetadata:
     @classmethod
     def from_attrs(cls, attrs: dict[str, Any]) -> "RegridderMetadata":
         """Parse back from netCDF attributes. Missing optional fields default."""
+
         def _range(key: str) -> tuple[float, float] | None:
             v = attrs.get(key)
             if v is None:
@@ -117,22 +122,23 @@ class RegridderMetadata:
             schema_version=int(attrs.get("schema_version", 0)),
         )
 
+
 try:
     import shapely
     from shapely.strtree import STRtree
 
     _HAS_SHAPELY = True
 except ImportError:  # pragma: no cover
-    shapely = None  # type: ignore[assignment]
-    STRtree = None  # type: ignore[assignment]
+    shapely = None
+    STRtree = None
     _HAS_SHAPELY = False
 
 try:
-    import sparse  # type: ignore
+    import sparse
 
     _HAS_SPARSE = True
 except ImportError:  # pragma: no cover
-    sparse = None  # type: ignore[assignment]
+    sparse = None
     _HAS_SPARSE = False
 
 
@@ -168,9 +174,12 @@ class _DirectionCache:
     by :meth:`ConservativeRegridder.transpose`.
     """
 
-    weights: "sparse.COO | np.ndarray | None" = None  # row-normalized (n_dst, n_src)
-    apply: "sparse.COO | np.ndarray | None" = None    # transposed + sorted, for matmul
-    coverage: np.ndarray | None = None                 # bool (n_dst,) — any source overlap
+    # row-normalized (n_dst, n_src)
+    weights: "sparse.COO | np.ndarray | None" = None
+    # transposed + sorted, for matmul
+    apply: "sparse.COO | np.ndarray | None" = None
+    # bool (n_dst,) — any source overlap
+    coverage: np.ndarray | None = None
 
 
 class ConservativeRegridder:
@@ -189,10 +198,13 @@ class ConservativeRegridder:
 
     Planar geometry only. Requires ``shapely >= 2.0``.
 
-    Example:
-        >>> regridder = ConservativeRegridder(src_ds, tgt_ds, x_coord="lon", y_coord="lat")
-        >>> out = regridder.regrid(da)              # forward
-        >>> back = regridder.T.regrid(out)          # backward
+    Example::
+
+        regridder = ConservativeRegridder(
+            src_ds, tgt_ds, x_coord="lon", y_coord="lat"
+        )
+        out = regridder.regrid(da)              # forward
+        back = regridder.T.regrid(out)          # backward
     """
 
     def __init__(
@@ -227,9 +239,7 @@ class ConservativeRegridder:
         self._dst_dims = dst_dims
         self._src_shape = tuple(int(source.sizes[d]) for d in src_dims)
         self._dst_shape = tuple(int(target.sizes[d]) for d in dst_dims)
-        self._areas = _build_intersection_areas(
-            src_grid, dst_grid, n_threads=n_threads
-        )
+        self._areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
         self._fwd = _DirectionCache()
@@ -249,14 +259,22 @@ class ConservativeRegridder:
             self._bwd.weights = _row_normalize(_transpose_weights(self._areas))
         return self._bwd.weights
 
-    def _apply_matrix(self, cache: _DirectionCache, weights: "sparse.COO | np.ndarray") -> "sparse.COO | np.ndarray":
+    def _apply_matrix(
+        self,
+        cache: _DirectionCache,
+        weights: "sparse.COO | np.ndarray",
+    ) -> "sparse.COO | np.ndarray":
         """The transposed, index-sorted weight matrix used for ``data @ W``
         matmul — avoiding sparse's per-call ``.T`` + ``_sort_indices``."""
         if cache.apply is None:
             cache.apply = _transpose_weights(weights, sort=True)
         return cache.apply
 
-    def _coverage_for(self, cache: _DirectionCache, areas: "sparse.COO | np.ndarray") -> np.ndarray:
+    def _coverage_for(
+        self,
+        cache: _DirectionCache,
+        areas: "sparse.COO | np.ndarray",
+    ) -> np.ndarray:
         """Boolean ``(n_dst,)`` mask: which destination cells have any source
         overlap. Uncovered cells produce NaN at apply time."""
         if cache.coverage is None:
@@ -313,8 +331,8 @@ class ConservativeRegridder:
         return new
 
     @property
-    def T(self) -> "ConservativeRegridder":
-        """Alias for :meth:`transpose`."""
+    def T(self) -> "ConservativeRegridder":  # noqa: N802
+        """Alias for :meth:`transpose` (numpy-style transpose)."""
         return self.transpose()
 
     def __repr__(self) -> str:
@@ -343,9 +361,7 @@ class ConservativeRegridder:
             target_y_range=_coord_range(self._target_coords, self.y_coord),
         )
 
-    def to_netcdf(
-        self, path: str | Path, engine: str | None = None
-    ) -> None:
+    def to_netcdf(self, path: str | Path, engine: NetcdfEngine = None) -> None:
         """Save the weight matrix and reproducibility metadata to a netCDF file.
 
         File layout:
@@ -384,7 +400,7 @@ class ConservativeRegridder:
 
     @classmethod
     def from_netcdf(
-        cls, path: str | Path, engine: str | None = None
+        cls, path: str | Path, engine: NetcdfEngine = None
     ) -> "ConservativeRegridder":
         """Reload a regridder previously written with :meth:`to_netcdf`.
 
@@ -507,10 +523,14 @@ class ConservativeRegridder:
             raise ValueError(msg)
 
         src_grid = _Grid(
-            polys=src_polys, bounds=shapely.bounds(src_polys), rectilinear=False,
+            polys=src_polys,
+            bounds=shapely.bounds(src_polys),
+            rectilinear=False,
         )
         dst_grid = _Grid(
-            polys=dst_polys, bounds=shapely.bounds(dst_polys), rectilinear=False,
+            polys=dst_polys,
+            bounds=shapely.bounds(dst_polys),
+            rectilinear=False,
         )
         n_src = int(src_polys.size)
         n_dst = int(dst_polys.size)
@@ -604,9 +624,12 @@ def conservative_2d_regrid(
         Regridded data on the target grid, preserving non-spatial dims.
     """
     regridder = ConservativeRegridder(
-        data, target_ds,
-        x_coord=x_coord, y_coord=y_coord,
-        spherical=spherical, n_threads=n_threads,
+        data,
+        target_ds,
+        x_coord=x_coord,
+        y_coord=y_coord,
+        spherical=spherical,
+        n_threads=n_threads,
     )
     return regridder.regrid(data, skipna=skipna, nan_threshold=nan_threshold)
 
@@ -636,7 +659,8 @@ def _apply_stored_weights(
     # dask-ify a numpy-backed input.
     if getattr(data, "chunks", None) is not None:
         split = {
-            d: -1 for d in src_dims
+            d: -1
+            for d in src_dims
             if d in data.dims and len(data.chunksizes.get(d, ())) > 1
         }
         if split:
@@ -651,7 +675,7 @@ def _apply_stored_weights(
         raise ValueError(msg)
 
     src_tokens = tuple(f"__src_{d}" for d in src_dims)
-    data_renamed = data.rename({s: t for s, t in zip(src_dims, src_tokens)})
+    data_renamed = data.rename(dict(zip(src_dims, src_tokens, strict=True)))
 
     output_dtype = _result_dtype(data)
     result = xr.apply_ufunc(
@@ -693,7 +717,7 @@ def _coverage_mask(areas: "sparse.COO | np.ndarray") -> np.ndarray:
         mask[areas.coords[0]] = True
         return mask
     arr = np.asarray(areas)
-    return (arr > 0).any(axis=1)
+    return np.asarray((arr > 0).any(axis=1))
 
 
 def _coo_components(
@@ -709,7 +733,12 @@ def _coo_components(
         )
     arr = np.asarray(w)
     rows, cols = np.nonzero(arr)
-    return rows.astype(np.int64, copy=False), cols.astype(np.int64, copy=False), arr[rows, cols], arr.shape
+    return (
+        rows.astype(np.int64, copy=False),
+        cols.astype(np.int64, copy=False),
+        arr[rows, cols],
+        arr.shape,
+    )
 
 
 def _coo_from_components(
@@ -731,9 +760,7 @@ def _coo_from_components(
     return dense
 
 
-def _coord_range(
-    ds: xr.Dataset, coord_name: str
-) -> tuple[float, float] | None:
+def _coord_range(ds: xr.Dataset, coord_name: str) -> tuple[float, float] | None:
     """Return ``(min, max)`` of a coord, or ``None`` when it isn't on the
     Dataset (e.g., the integer-index stub emitted by ``from_polygons``)."""
     if not coord_name or coord_name not in ds.coords:
@@ -811,9 +838,7 @@ def _grid_from_coords(
     """
     xd = obj[x_coord]
     yd = obj[y_coord]
-    is_rectilinear = (
-        xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]
-    )
+    is_rectilinear = xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]
     if spherical:
         if not is_rectilinear:
             msg = (
@@ -821,9 +846,7 @@ def _grid_from_coords(
                 "coordinate arrays in this version."
             )
             raise NotImplementedError(msg)
-        return _build_cea_grid(
-            np.asarray(xd.values), np.asarray(yd.values)
-        )
+        return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
     if is_rectilinear:
         return _build_grid(np.asarray(xd.values), np.asarray(yd.values))
     xc, yc = xr.broadcast(obj[x_coord], obj[y_coord])
@@ -866,15 +889,15 @@ def _infer_1d_edges(centers: np.ndarray) -> np.ndarray:
     return np.concatenate([[left], mids, [right]])
 
 
-def _infer_2d_corners(
-    xc: np.ndarray, yc: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def _infer_2d_corners(xc: np.ndarray, yc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (ny+1, nx+1) cell-corner arrays from 2D cell-center arrays.
 
     Interior corners are the mean of the four surrounding centers; boundary
     corners are reflected from the adjacent interior row/column.
     """
-    assert xc.shape == yc.shape and xc.ndim == 2
+    if xc.shape != yc.shape or xc.ndim != 2:
+        msg = "xc and yc must be 2D arrays of the same shape"
+        raise ValueError(msg)
 
     def corners(a: np.ndarray) -> np.ndarray:
         ny, nx = a.shape
@@ -964,8 +987,8 @@ def _build_intersection_areas(
     areas are computed analytically from the bounds, skipping GEOS clipping.
     """
     _check_shapely()
-    n_dst = int(len(dst.polys))
-    n_src = int(len(src.polys))
+    n_dst = len(dst.polys)
+    n_src = len(src.polys)
 
     tree = STRtree(src.polys)
     pairs = tree.query(dst.polys, predicate="intersects")

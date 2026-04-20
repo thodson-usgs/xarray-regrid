@@ -1,4 +1,5 @@
 """Tests for the polygon-intersection conservative regridder."""
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -7,6 +8,7 @@ import xarray_regrid  # noqa: F401  (registers the accessor)
 from xarray_regrid import ConservativeRegridder, RegridderMetadata, polygons_from_coords
 
 shapely = pytest.importorskip("shapely")
+h5py = pytest.importorskip("h5py")
 
 
 def _rect_da(ny=60, nx=120, nt=2, seed=0):
@@ -83,9 +85,7 @@ def test_polygon_curvilinear_target():
     th = np.deg2rad(30)
     x2d = xi * np.cos(th) - yi * np.sin(th)
     y2d = xi * np.sin(th) + yi * np.cos(th)
-    target = xr.Dataset(
-        coords={"x": (("ny", "nx"), x2d), "y": (("ny", "nx"), y2d)}
-    )
+    target = xr.Dataset(coords={"x": (("ny", "nx"), x2d), "y": (("ny", "nx"), y2d)})
     out = da.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     assert out.shape == (2, 20, 30)
     assert np.isfinite(out.values).mean() > 0.9
@@ -169,7 +169,7 @@ def test_regridder_transpose_roundtrip_rectilinear_aligned():
     np.testing.assert_allclose(back.values, 3.5, atol=1e-12)
 
 
-def test_regridder_T_preserves_weights():
+def test_regridder_T_preserves_weights():  # noqa: N802
     """regridder.T.T should share the raw area matrix with the original."""
     da = _rect_da()
     target = _rect_target()
@@ -224,10 +224,10 @@ def test_spherical_mode_matches_factored():
 
 
 def test_spherical_conserves_integral():
-    """Mass conservation check on the sphere. For cos²(lat), true integral is
-    8π/3; the regridder on a 2°→6° grid should keep the spherical-area-weighted
-    sum within the grid quadrature floor when spherical=True, and miss it by
-    ~17× more when spherical=False."""
+    """Mass conservation check on the sphere. For cos^2(lat), true integral is
+    8*pi/3; the regridder on a 2-to-6-degree grid should keep the
+    spherical-area-weighted sum within the grid quadrature floor when
+    spherical=True, and miss it by ~17x more when spherical=False."""
     lon_s = np.linspace(-180, 180, 180, endpoint=False) + 1.0
     lat_s = np.linspace(-90, 90, 90, endpoint=False) + 1.0
     lon_t = np.linspace(-180, 180, 60, endpoint=False) + 3.0
@@ -247,16 +247,18 @@ def test_spherical_conserves_integral():
     )
 
     # True target spherical cell areas
-    dlon = np.deg2rad(np.gradient(lat_t.astype(float) * 0 + np.mean(np.diff(lon_t))))
     dlon_arr = np.full(lon_t.size, np.deg2rad(np.mean(np.diff(lon_t))))
     lat_r = np.deg2rad(lat_t)
     dlat_r = np.gradient(lat_r)
-    a_tgt = (np.sin(lat_r + dlat_r / 2) - np.sin(lat_r - dlat_r / 2))[:, None] * dlon_arr[None, :]
+    dlat_bands = np.sin(lat_r + dlat_r / 2) - np.sin(lat_r - dlat_r / 2)
+    a_tgt = dlat_bands[:, None] * dlon_arr[None, :]
 
     true_val = 8 * np.pi / 3
-    err_sph = abs(float((out_sph.transpose("latitude", "longitude").values * a_tgt).sum()) - true_val)
-    err_raw = abs(float((out_raw.transpose("latitude", "longitude").values * a_tgt).sum()) - true_val)
-    # Spherical should be at least 10× more accurate than raw planar on this grid.
+    sph_vals = out_sph.transpose("latitude", "longitude").values
+    raw_vals = out_raw.transpose("latitude", "longitude").values
+    err_sph = abs(float((sph_vals * a_tgt).sum()) - true_val)
+    err_raw = abs(float((raw_vals * a_tgt).sum()) - true_val)
+    # Spherical should be at least 10x more accurate than raw planar here.
     assert err_sph < 0.1 * err_raw, f"err_sph={err_sph:.2e} err_raw={err_raw:.2e}"
 
 
@@ -264,7 +266,6 @@ def test_spherical_conserves_integral():
 
 
 def _box_polygons():
-    import shapely
     rng = np.random.default_rng(1)
     n = 50
     cx = rng.uniform(-170, 170, n)
@@ -293,7 +294,6 @@ def test_from_polygons_basic():
 def test_from_polygons_mass_conservation():
     """Sum of intersected mass should match the direct A·s calculation to
     machine precision for any source field."""
-    import shapely
 
     src_polys = _box_polygons()
     tgt_polys = polygons_from_coords(
@@ -307,12 +307,12 @@ def test_from_polygons_mass_conservation():
     s = rng.normal(size=src_polys.size)
     da = xr.DataArray(s, dims=("face",))
     out = rgr.regrid(da).values
-    # Direct mass = Σ_i s_i × (Σ_j A_ij). Matches output if we multiply output
-    # by target-covered area = Σ_i A_ij.
-    A = rgr._areas  # (n_tgt, n_src)
-    tgt_covered = A.sum(axis=1).todense()
+    # Direct mass = sum_i s_i * (sum_j A_ij). Matches output if we multiply
+    # output by target-covered area = sum_i A_ij.
+    areas = rgr._areas  # (n_tgt, n_src)
+    tgt_covered = areas.sum(axis=1).todense()
     valid = tgt_covered > 0
-    direct = float((s * A.sum(axis=0).todense()).sum())
+    direct = float((s * areas.sum(axis=0).todense()).sum())
     via_regrid = float((out[valid] * tgt_covered[valid]).sum())
     rel = abs(direct - via_regrid) / max(abs(direct), 1e-12)
     assert rel < 1e-12, f"rel err {rel:.2e}"
@@ -320,7 +320,6 @@ def test_from_polygons_mass_conservation():
 
 def test_from_polygons_transpose_roundtrip():
     """Roundtrip mesh ↔ mesh of a constant field returns the constant."""
-    import shapely
     src_polys = polygons_from_coords(
         np.linspace(-180, 180, 24, endpoint=False) + 7.5,
         np.linspace(-90, 90, 12, endpoint=False) + 7.5,
@@ -343,7 +342,6 @@ def test_from_polygons_transpose_roundtrip():
 
 def test_from_polygons_nan_propagation():
     """NaN source cells propagate through skipna=True correctly."""
-    import shapely
     src_polys = polygons_from_coords(
         np.linspace(-180, 180, 24, endpoint=False) + 7.5,
         np.linspace(-90, 90, 12, endpoint=False) + 7.5,
@@ -361,14 +359,15 @@ def test_from_polygons_nan_propagation():
     out_keep = rgr.regrid(da, nan_threshold=1.0)
     out_strict = rgr.regrid(da, nan_threshold=0.0)
     # Strict should have at least as many NaNs.
-    assert int(np.isnan(out_strict.values).sum()) >= int(np.isnan(out_keep.values).sum())
+    strict_nans = int(np.isnan(out_strict.values).sum())
+    keep_nans = int(np.isnan(out_keep.values).sum())
+    assert strict_nans >= keep_nans
 
 
 def test_from_polygons_target_outside_source_is_nan():
     """Target cells entirely outside the source domain must be NaN regardless
     of skipna (regression test for a bug where the "skip mask matmul when no
     NaNs" optimization returned zeros for uncovered cells)."""
-    import shapely
 
     src = np.array([shapely.box(0, 0, 1, 1)], dtype=object)
     tgt = polygons_from_coords(
@@ -386,7 +385,6 @@ def test_from_polygons_target_outside_source_is_nan():
 
 def test_from_polygons_hole_is_nan():
     """A target cell fully inside a source-polygon hole should be NaN, not 0."""
-    import shapely
 
     ring_with_hole = shapely.Polygon(
         [(0, 0), (10, 0), (10, 10), (0, 10)],
@@ -405,7 +403,6 @@ def test_from_polygons_hole_is_nan():
 
 def test_from_polygons_input_validation():
     # 2D polygons array rejected
-    import shapely
     p = shapely.box(0, 0, 1, 1)
     arr_2d = np.array([[p, p], [p, p]], dtype=object)
     with pytest.raises(ValueError, match="1D"):
@@ -487,7 +484,6 @@ def test_to_netcdf_transpose_works_after_reload(tmp_path):
 
 def test_to_netcdf_unstructured_roundtrip(tmp_path):
     """from_polygons regridder roundtrips too (single spatial dim each side)."""
-    import shapely
     rng = np.random.default_rng(1)
     cx = rng.uniform(-170, 170, 30)
     cy = rng.uniform(-80, 80, 30)
@@ -535,7 +531,6 @@ def test_to_netcdf_metadata_fields(tmp_path):
 
 def test_from_netcdf_rejects_unknown_schema(tmp_path):
     """Loading a file written with a future schema version raises cleanly."""
-    import h5py
     da = _rect_da()
     target = _rect_target()
     rgr = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
@@ -563,9 +558,7 @@ def test_regridder_transpose_curvilinear():
     th = np.deg2rad(15)
     x2 = xi * np.cos(th) - yi * np.sin(th)
     y2 = xi * np.sin(th) + yi * np.cos(th)
-    target = xr.Dataset(
-        coords={"x": (("ny", "nx"), x2), "y": (("ny", "nx"), y2)}
-    )
+    target = xr.Dataset(coords={"x": (("ny", "nx"), x2), "y": (("ny", "nx"), y2)})
     regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
     fwd = regridder.regrid(da)
     assert fwd.dims == ("time", "ny", "nx")
