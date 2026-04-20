@@ -6,7 +6,7 @@ import xarray as xr
 
 from xarray_regrid.methods import (
     conservative,
-    conservative_polygon,
+    conservative_2d,
     flox_reduce,
     interp,
 )
@@ -22,9 +22,11 @@ class Regridder:
         linear: linear, bilinear, or higher dimensional linear interpolation
         nearest: nearest-neighbor regridding
         cubic: cubic spline regridding
-        conservative: axis-factored conservative regridding (rectilinear only)
-        conservative_polygon: polygon-intersection conservative regridding,
-            including curvilinear grids (requires shapely)
+        conservative: axis-factored conservative regridding (rectilinear,
+            1D-separable grids only)
+        conservative_2d: conservative regridding for grids that aren't
+            1D-separable — curvilinear 2D coords, unstructured meshes, or
+            arbitrary polygon-to-polygon aggregation (requires shapely)
         most_common: most common value regridder
         stat: area statistics regridder
     """
@@ -89,7 +91,7 @@ class Regridder:
         ds_formatted = format_for_regrid(self._obj, ds_target_grid)
         return interp.interp_regrid(ds_formatted, ds_target_grid, "cubic")
 
-    def conservative_polygon(
+    def conservative_2d(
         self,
         ds_target_grid: xr.Dataset,
         x_coord: str = "longitude",
@@ -100,13 +102,14 @@ class Regridder:
         nan_threshold: float = 1.0,
         n_threads: int | None = None,
     ) -> xr.DataArray | xr.Dataset:
-        """Polygon-intersection conservative regrid.
+        """Conservative regrid for grids that aren't 1D-separable.
 
-        Unlike ``.conservative``, this path handles curvilinear grids whose
-        x/y coordinates are 2D arrays. Defaults to planar geometry; set
-        ``spherical=True`` for lat/lon grids in degrees to get proper
-        spherical area weights via a cylindrical equal-area projection.
-        Requires ``shapely >= 2.0``.
+        Use this when ``.conservative`` can't express your grid: curvilinear
+        coordinates (2D ``lat``/``lon`` arrays), unstructured meshes, or any
+        arbitrary polygon target. Computes 2D cell-polygon intersections via
+        shapely. Defaults to planar geometry; set ``spherical=True`` for
+        lat/lon grids in degrees to get proper spherical area weights via an
+        analytic cylindrical equal-area projection. Requires ``shapely >= 2.0``.
 
         Args:
             ds_target_grid: Dataset defining the target grid; must expose
@@ -136,7 +139,7 @@ class Regridder:
         # matched by coord values, not by dim name.
         if time_dim is not None and time_dim in ds_target_grid.coords:
             ds_target_grid = ds_target_grid.isel({time_dim: 0}).reset_coords()
-        return conservative_polygon.polygon_conservative_regrid(
+        return conservative_2d.conservative_2d_regrid(
             self._obj,
             ds_target_grid,
             x_coord=x_coord,

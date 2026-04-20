@@ -33,7 +33,7 @@ def test_polygon_matches_factored_planar():
     da = _rect_da()
     target = _rect_target()
     ref = da.regrid.conservative(target, latitude_coord=None)
-    got = da.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    got = da.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     got = got.transpose(*ref.dims)
     np.testing.assert_allclose(got.values, ref.values, atol=1e-12)
 
@@ -41,7 +41,7 @@ def test_polygon_matches_factored_planar():
 def test_polygon_dask_time_chunks():
     da = _rect_da(nt=4).chunk({"time": 2})
     target = _rect_target()
-    got = da.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    got = da.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     assert got.chunks is not None
     got = got.compute()
     ref = _rect_da(nt=4).regrid.conservative(target, latitude_coord=None)
@@ -52,7 +52,7 @@ def test_polygon_rechunks_spatial():
     """Spatially-chunked input should be accepted (rechunked internally)."""
     da = _rect_da().chunk({"time": 1, "y": 30, "x": 40})
     target = _rect_target()
-    out = da.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    out = da.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     out.compute()
 
 
@@ -62,10 +62,10 @@ def test_polygon_nan_threshold():
     da = _rect_da()
     da.values[:, 21:29, :] = np.nan
     target = _rect_target(ny=23, nx=47)
-    out1 = da.regrid.conservative_polygon(
+    out1 = da.regrid.conservative_2d(
         target, x_coord="x", y_coord="y", skipna=True, nan_threshold=1.0
     )
-    out0 = da.regrid.conservative_polygon(
+    out0 = da.regrid.conservative_2d(
         target, x_coord="x", y_coord="y", skipna=True, nan_threshold=0.0
     )
     assert int(np.isnan(out0.values).sum()) > int(np.isnan(out1.values).sum())
@@ -86,7 +86,7 @@ def test_polygon_curvilinear_target():
     target = xr.Dataset(
         coords={"x": (("ny", "nx"), x2d), "y": (("ny", "nx"), y2d)}
     )
-    out = da.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    out = da.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     assert out.shape == (2, 20, 30)
     assert np.isfinite(out.values).mean() > 0.9
 
@@ -94,7 +94,7 @@ def test_polygon_curvilinear_target():
 def test_polygon_nan_threshold_invalid():
     da = _rect_da()
     with pytest.raises(ValueError):
-        da.regrid.conservative_polygon(
+        da.regrid.conservative_2d(
             _rect_target(), x_coord="x", y_coord="y", nan_threshold=1.5
         )
 
@@ -104,7 +104,7 @@ def test_polygon_dataset_input():
     da = _rect_da()
     ds = xr.Dataset({"a": da, "b": da * 2.0})
     target = _rect_target()
-    out = ds.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    out = ds.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     assert set(out.data_vars) == {"a", "b"}
     np.testing.assert_allclose(
         out["b"].transpose(*out["a"].dims).values,
@@ -118,13 +118,13 @@ def test_polygon_dataset_input():
 
 def test_regridder_reusable_matches_oneshot():
     """Reusing a single ConservativeRegridder on multiple fields matches the
-    one-shot `polygon_conservative_regrid` call."""
+    one-shot `conservative_2d_regrid` call."""
     da1 = _rect_da(seed=1)
     da2 = _rect_da(seed=2)
     target = _rect_target()
     regridder = ConservativeRegridder(da1, target, x_coord="x", y_coord="y")
-    ref1 = da1.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
-    ref2 = da2.regrid.conservative_polygon(target, x_coord="x", y_coord="y")
+    ref1 = da1.regrid.conservative_2d(target, x_coord="x", y_coord="y")
+    ref2 = da2.regrid.conservative_2d(target, x_coord="x", y_coord="y")
     out1 = regridder.regrid(da1)
     out2 = regridder(da2)  # __call__ alias
     np.testing.assert_allclose(out1.values, ref1.values, atol=1e-12)
@@ -209,7 +209,7 @@ def test_spherical_mode_matches_factored():
     target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
 
     factored = da.regrid.conservative(target, latitude_coord="latitude")
-    polygon = da.regrid.conservative_polygon(
+    polygon = da.regrid.conservative_2d(
         target, x_coord="longitude", y_coord="latitude", spherical=True
     )
     # Both methods should agree to the grid's own quadrature accuracy. Near the
@@ -239,10 +239,10 @@ def test_spherical_conserves_integral():
     )
     target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
 
-    out_sph = da.regrid.conservative_polygon(
+    out_sph = da.regrid.conservative_2d(
         target, x_coord="longitude", y_coord="latitude", spherical=True
     )
-    out_raw = da.regrid.conservative_polygon(
+    out_raw = da.regrid.conservative_2d(
         target, x_coord="longitude", y_coord="latitude", spherical=False
     )
 

@@ -1,5 +1,5 @@
 from xarray_regrid import methods
-from xarray_regrid.methods.conservative_polygon import (
+from xarray_regrid.methods.conservative_2d import (
     ConservativeRegridder,
     RegridderMetadata,
     polygons_from_coords,

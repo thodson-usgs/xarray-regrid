@@ -1,9 +1,17 @@
-"""Polygon-intersection conservative regridding (planar only).
+"""Conservative regridding for grids that aren't 1D-separable.
 
-General conservative regridding that computes 2D cell-polygon intersections
-rather than the axis-factored 1D overlap approach used by ``conservative``.
-Slower and more memory-intensive than the factored path for rectilinear grids,
-but handles curvilinear grids that the factored approach cannot represent.
+The existing ``conservative`` method uses axis-factored 1D overlap — fast and
+elegant but strictly rectilinear. This module computes the full 2D cell
+intersection via shapely, so it handles:
+
+- curvilinear grids (2D ``lat[i, j]`` / ``lon[i, j]`` coordinate variables)
+- unstructured meshes (arbitrary polygon cells, via
+  :meth:`ConservativeRegridder.from_polygons`)
+- grid-to-polygon aggregation (e.g. gridded data → country shapes)
+
+For rectilinear grids a cheap analytic fast-path is used, but this module is
+still slower and more memory-intensive than ``conservative``; prefer the
+axis-factored path when your grid is 1D-separable.
 
 Requires ``shapely >= 2.0``. If ``sparse`` is available, the weight matrix is
 stored as ``sparse.COO``; otherwise a dense numpy matrix is used.
@@ -151,15 +159,20 @@ def _check_shapely() -> None:
 
 
 class ConservativeRegridder:
-    """Reusable planar-polygon conservative regridder.
+    """Reusable conservative regridder for grids that aren't 1D-separable.
+
+    Use this when your source or target isn't a pure rectilinear lat/lon
+    grid: curvilinear coordinates (2D ``lat[i, j]`` / ``lon[i, j]``),
+    unstructured meshes (via :meth:`from_polygons`), or arbitrary
+    polygon-to-polygon aggregation. For plain 1D-separable rectilinear
+    grids, the existing ``.conservative`` accessor is much faster.
 
     Build once from source and target grids; apply to many compatible fields
     via :meth:`regrid` (or by calling the regridder). The raw intersection
     area matrix is stored internally; the forward and backward row-normalized
     weight matrices are lazily cached on first use.
 
-    Handles rectilinear (1D coord arrays) and curvilinear (2D coord arrays)
-    grids; planar geometry only. Requires ``shapely >= 2.0``.
+    Planar geometry only. Requires ``shapely >= 2.0``.
 
     Example:
         >>> regridder = ConservativeRegridder(src_ds, tgt_ds, x_coord="lon", y_coord="lat")
@@ -558,7 +571,7 @@ def polygons_from_coords(
     return _build_grid(x, y).polys
 
 
-def polygon_conservative_regrid(
+def conservative_2d_regrid(
     data: xr.DataArray | xr.Dataset,
     target_ds: xr.Dataset,
     x_coord: str = "longitude",
