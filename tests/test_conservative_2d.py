@@ -1,14 +1,13 @@
-"""Tests for the polygon-intersection conservative regridder."""
+"""Tests for conservative_2d."""
 
 import numpy as np
 import pytest
 import xarray as xr
 
 import xarray_regrid  # noqa: F401  (registers the accessor)
-from xarray_regrid import ConservativeRegridder, RegridderMetadata, polygons_from_coords
+from xarray_regrid import ConservativeRegridder, polygons_from_coords
 
 shapely = pytest.importorskip("shapely")
-h5py = pytest.importorskip("h5py")
 
 
 def _rect_da(ny=60, nx=120, nt=2, seed=0):
@@ -91,6 +90,26 @@ def test_polygon_curvilinear_target():
     assert np.isfinite(out.values).mean() > 0.9
 
 
+def test_antimeridian_rectilinear_constant():
+    da = xr.DataArray(
+        np.full((2, 4), 2.5),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": np.array([-2.5, 2.5]),
+            "longitude": np.array([167.5, 172.5, -177.5, -172.5]),
+        },
+    )
+    target = xr.Dataset(
+        coords={
+            "latitude": np.array([-2.5, 2.5]),
+            "longitude": np.array([170.0, -170.0]),
+        }
+    )
+
+    out = da.regrid.conservative_2d(target, x_coord="longitude", y_coord="latitude")
+    np.testing.assert_allclose(out.values, 2.5, atol=1e-12)
+
+
 def test_polygon_nan_threshold_invalid():
     da = _rect_da()
     with pytest.raises(ValueError):
@@ -136,12 +155,11 @@ def test_regridder_weight_cache():
     da = _rect_da()
     target = _rect_target()
     regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
-    assert regridder._fwd.weights is None
+    assert "forward_weights" not in regridder.__dict__
     regridder.regrid(da)
-    w1 = regridder._fwd.weights
-    assert w1 is not None
+    w1 = regridder.forward_weights
     regridder.regrid(da)
-    assert regridder._fwd.weights is w1  # same object, not rebuilt
+    assert regridder.forward_weights is w1  # same object, not rebuilt
 
 
 def test_regridder_transpose_roundtrip_rectilinear_aligned():
@@ -273,6 +291,17 @@ def _box_polygons():
     return shapely.box(cx - 5, cy - 5, cx + 5, cy + 5)
 
 
+def test_polygons_from_coords_periodic():
+    polys = polygons_from_coords(
+        np.array([167.5, 172.5, -177.5, -172.5]),
+        np.array([-2.5, 2.5]),
+        periodic=True,
+    )
+    bounds = shapely.bounds(polys)
+    widths = bounds[:, 2] - bounds[:, 0]
+    assert np.all(widths < 10.1)
+
+
 def test_from_polygons_basic():
     src_polys = _box_polygons()
     tgt_polys = polygons_from_coords(
@@ -289,6 +318,33 @@ def test_from_polygons_basic():
     out = rgr.regrid(da)
     assert out.dims == ("cell",)
     assert out.sizes["cell"] == tgt_polys.size
+
+
+def test_from_polygons_periodic_antimeridian():
+    src_polys = np.array(
+        [shapely.Polygon([(175, -5), (-175, -5), (-175, 5), (175, 5)])],
+        dtype=object,
+    )
+    tgt_polys = np.array(
+        [
+            shapely.box(160, -5, 170, 5),
+            shapely.box(175, -5, 185, 5),
+            shapely.box(-170, -5, -160, 5),
+        ],
+        dtype=object,
+    )
+    rgr = ConservativeRegridder.from_polygons(
+        src_polys,
+        tgt_polys,
+        source_dim="src",
+        target_dim="tgt",
+        periodic=True,
+    )
+    out = rgr.regrid(xr.DataArray([7.0], dims=("src",)))
+
+    assert np.isnan(out.values[0])
+    assert out.values[1] == pytest.approx(7.0)
+    assert np.isnan(out.values[2])
 
 
 def test_from_polygons_mass_conservation():
@@ -514,23 +570,23 @@ def test_to_netcdf_metadata_fields(tmp_path):
 
     with xr.open_dataset(path) as ds:
         attrs = dict(ds.attrs)
-    meta = RegridderMetadata.from_attrs(attrs)
 
-    assert meta.x_coord == "x"
-    assert meta.y_coord == "y"
-    assert meta.spherical is False
-    assert meta.src_shape == rgr._src_shape
-    assert meta.dst_shape == rgr._dst_shape
+    assert attrs["x_coord"] == "x"
+    assert attrs["y_coord"] == "y"
+    assert bool(int(attrs["spherical"])) is False
+    assert tuple(int(size) for size in attrs["src_shape"]) == rgr._src_shape
+    assert tuple(int(size) for size in attrs["dst_shape"]) == rgr._dst_shape
     # Grid ranges captured when the coord is present in source/target.
-    assert meta.source_x_range is not None
-    assert meta.target_x_range is not None
-    assert meta.source_x_range[0] <= meta.source_x_range[1]
-    assert meta.created  # non-empty ISO timestamp
-    assert meta.schema_version == 1
+    assert "source_x_range" in attrs
+    assert "target_x_range" in attrs
+    assert attrs["source_x_range"][0] <= attrs["source_x_range"][1]
+    assert attrs["created"]
+    assert int(attrs["schema_version"]) == 1
 
 
 def test_from_netcdf_rejects_unknown_schema(tmp_path):
     """Loading a file written with a future schema version raises cleanly."""
+    h5py = pytest.importorskip("h5py")
     da = _rect_da()
     target = _rect_target()
     rgr = ConservativeRegridder(da, target, x_coord="x", y_coord="y")

@@ -1,7 +1,6 @@
 from xarray_regrid import methods
 from xarray_regrid.methods.conservative_2d import (
     ConservativeRegridder,
-    RegridderMetadata,
     polygons_from_coords,
 )
 from xarray_regrid.regrid import Regridder
@@ -11,7 +10,6 @@ __all__ = [
     "ConservativeRegridder",
     "Grid",
     "Regridder",
-    "RegridderMetadata",
     "create_regridding_dataset",
     "methods",
     "polygons_from_coords",

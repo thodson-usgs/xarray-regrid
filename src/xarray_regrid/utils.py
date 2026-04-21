@@ -114,6 +114,22 @@ def create_regridding_dataset(
     )
 
 
+def infer_1d_edges(centers: np.ndarray) -> np.ndarray:
+    """Return cell edges from 1D centers: midpoints between consecutive
+    centers, with symmetric reflection for the two outer bounds.
+
+    Requires at least two centers.
+    """
+    c = np.asarray(centers, dtype=float)
+    if c.size < 2:
+        msg = "need at least two centers to infer cell edges"
+        raise ValueError(msg)
+    mids = 0.5 * (c[:-1] + c[1:])
+    left = 2 * c[0] - mids[0]
+    right = 2 * c[-1] - mids[-1]
+    return np.concatenate([[left], mids, [right]])
+
+
 def to_intervalindex(coords: np.ndarray) -> pd.IntervalIndex:
     """Convert a 1-d coordinate array to a pandas IntervalIndex. Take
     the midpoints between the coordinates as the interval boundaries.
@@ -126,20 +142,9 @@ def to_intervalindex(coords: np.ndarray) -> pd.IntervalIndex:
             coordinates.
     """
     if len(coords) > 1:
-        midpoints = (coords[:-1] + coords[1:]) / 2
-
-        # Extrapolate outer bounds beyond the first and last coordinates
-        left_bound = 2 * coords[0] - midpoints[0]
-        right_bound = 2 * coords[-1] - midpoints[-1]
-
-        breaks = np.concatenate([[left_bound], midpoints, [right_bound]])
-        intervals = pd.IntervalIndex.from_breaks(breaks)
-
-    else:
-        # If the target grid has a single point, set search interval to span all space
-        intervals = pd.IntervalIndex.from_breaks([-np.inf, np.inf])
-
-    return intervals
+        return pd.IntervalIndex.from_breaks(infer_1d_edges(coords))
+    # If the target grid has a single point, set search interval to span all space
+    return pd.IntervalIndex.from_breaks([-np.inf, np.inf])
 
 
 def overlap(a: pd.IntervalIndex, b: pd.IntervalIndex) -> np.ndarray:
@@ -436,8 +441,8 @@ def update_coord(
 def update_coord(
     obj: xr.DataArray | xr.Dataset, coord: Hashable, coord_vals: np.ndarray
 ) -> xr.DataArray | xr.Dataset:
-    """Update the values of a coordinate, ensuring indexes stay in sync."""
-    attrs = obj.coords[coord].attrs
-    obj = obj.assign_coords({coord: coord_vals})
-    obj.coords[coord].attrs = attrs
-    return obj
+    """Update the values of a coordinate, ensuring indexes stay in sync.
+    Preserves the coord's existing dims and attrs (so multi-dim coords work)."""
+    original = obj.coords[coord]
+    new_coord = xr.DataArray(coord_vals, dims=original.dims, attrs=original.attrs)
+    return obj.assign_coords({coord: new_coord})

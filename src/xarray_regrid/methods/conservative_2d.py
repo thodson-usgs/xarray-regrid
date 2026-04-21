@@ -21,22 +21,22 @@ import os
 import warnings
 from collections.abc import Hashable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import cache
+from functools import cached_property
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import xarray as xr
 
+from xarray_regrid import utils
+
 NetcdfEngine = Literal["netcdf4", "scipy", "h5netcdf"] | None
 
 
-@cache
 def _package_version() -> str:
-    """Cached ``importlib.metadata`` lookup."""
     try:
         return version("xarray-regrid")
     except PackageNotFoundError:
@@ -47,89 +47,15 @@ def _package_version() -> str:
 _SCHEMA_VERSION = 1
 
 
-@dataclass(frozen=True)
-class RegridderMetadata:
-    """Serialized build parameters of a :class:`ConservativeRegridder`.
-
-    Fields become netCDF attributes via :meth:`to_attrs`; the loader
-    reconstructs via :meth:`from_attrs`. Keep new fields optional so older
-    files remain loadable.
-    """
-
-    x_coord: str
-    y_coord: str
-    spherical: bool
-    src_dims: tuple[str, ...]
-    dst_dims: tuple[str, ...]
-    src_shape: tuple[int, ...]
-    dst_shape: tuple[int, ...]
-    source_x_range: tuple[float, float] | None = None
-    source_y_range: tuple[float, float] | None = None
-    target_x_range: tuple[float, float] | None = None
-    target_y_range: tuple[float, float] | None = None
-    xarray_regrid_version: str = field(default_factory=_package_version)
-    created: str = field(
-        default_factory=lambda: datetime.now(tz=timezone.utc).isoformat()
-    )
-    schema_version: int = _SCHEMA_VERSION
-
-    def to_attrs(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["spherical"] = int(d["spherical"])
-        d["src_dims"] = list(d["src_dims"])
-        d["dst_dims"] = list(d["dst_dims"])
-        d["src_shape"] = list(d["src_shape"])
-        d["dst_shape"] = list(d["dst_shape"])
-        for key in (
-            "source_x_range",
-            "source_y_range",
-            "target_x_range",
-            "target_y_range",
-        ):
-            if d[key] is None:
-                del d[key]
-            else:
-                d[key] = list(d[key])
-        return d
-
-    @classmethod
-    def from_attrs(cls, attrs: dict[str, Any]) -> "RegridderMetadata":
-        """Parse back from netCDF attributes. Missing optional fields default."""
-
-        def _range(key: str) -> tuple[float, float] | None:
-            v = attrs.get(key)
-            if v is None:
-                return None
-            arr = np.atleast_1d(v)
-            return (float(arr[0]), float(arr[1]))
-
-        return cls(
-            x_coord=str(attrs["x_coord"]),
-            y_coord=str(attrs["y_coord"]),
-            spherical=bool(int(attrs["spherical"])),
-            src_dims=tuple(str(d) for d in np.atleast_1d(attrs["src_dims"])),
-            dst_dims=tuple(str(d) for d in np.atleast_1d(attrs["dst_dims"])),
-            src_shape=tuple(int(s) for s in np.atleast_1d(attrs["src_shape"])),
-            dst_shape=tuple(int(s) for s in np.atleast_1d(attrs["dst_shape"])),
-            source_x_range=_range("source_x_range"),
-            source_y_range=_range("source_y_range"),
-            target_x_range=_range("target_x_range"),
-            target_y_range=_range("target_y_range"),
-            xarray_regrid_version=str(attrs.get("xarray_regrid_version", "unknown")),
-            created=str(attrs.get("created", "")),
-            # Default to 0 so files written before this attr existed fail the
-            # schema check rather than silently appearing current.
-            schema_version=int(attrs.get("schema_version", 0)),
-        )
-
-
 try:
     import shapely
+    from shapely import affinity
     from shapely.strtree import STRtree
 
     _HAS_SHAPELY = True
 except ImportError:  # pragma: no cover
     shapely = None
+    affinity = None
     STRtree = None
     _HAS_SHAPELY = False
 
@@ -162,24 +88,6 @@ SHAPELY_IMPORT_ERROR = (
 def _check_shapely() -> None:
     if not _HAS_SHAPELY:
         raise ImportError(SHAPELY_IMPORT_ERROR)
-
-
-@dataclass
-class _DirectionCache:
-    """Lazy derivatives of an intersection-area matrix for one regrid direction.
-
-    All three fields are functions of ``_areas`` (forward) or of the transposed
-    ``_areas`` (backward), so they're kept together. Populated on first access
-    by the corresponding ``ConservativeRegridder`` accessor; swapped as a unit
-    by :meth:`ConservativeRegridder.transpose`.
-    """
-
-    # row-normalized (n_dst, n_src)
-    weights: "sparse.COO | np.ndarray | None" = None
-    # transposed + sorted, for matmul
-    apply: "sparse.COO | np.ndarray | None" = None
-    # bool (n_dst,) — any source overlap
-    coverage: np.ndarray | None = None
 
 
 class ConservativeRegridder:
@@ -217,8 +125,9 @@ class ConservativeRegridder:
         n_threads: int | None = None,
     ) -> None:
         _check_shapely()
-        src_dims = _spatial_dims(source, x_coord, y_coord)
-        dst_dims = _spatial_dims(target, x_coord, y_coord)
+        source_grid, target_grid = _normalize_longitude_coords(source, target, x_coord)
+        src_dims = _spatial_dims(source_grid, x_coord, y_coord)
+        dst_dims = _spatial_dims(target_grid, x_coord, y_coord)
         if not src_dims:
             msg = f"source has no dims for coords {x_coord!r}, {y_coord!r}"
             raise ValueError(msg)
@@ -226,10 +135,10 @@ class ConservativeRegridder:
             msg = f"target has no dims for coords {x_coord!r}, {y_coord!r}"
             raise ValueError(msg)
         src_grid = _grid_from_coords(
-            source, x_coord, y_coord, src_dims, spherical=spherical
+            source_grid, x_coord, y_coord, src_dims, spherical=spherical
         )
         dst_grid = _grid_from_coords(
-            target, x_coord, y_coord, dst_dims, spherical=spherical
+            target_grid, x_coord, y_coord, dst_dims, spherical=spherical
         )
         self.spherical = spherical
 
@@ -242,44 +151,34 @@ class ConservativeRegridder:
         self._areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
-        self._fwd = _DirectionCache()
-        self._bwd = _DirectionCache()
 
-    @property
+    @cached_property
     def forward_weights(self) -> "sparse.COO | np.ndarray":
         """The row-normalized forward weight matrix (source → target)."""
-        if self._fwd.weights is None:
-            self._fwd.weights = _row_normalize(self._areas)
-        return self._fwd.weights
+        return _row_normalize(self._areas)
 
-    @property
+    @cached_property
     def backward_weights(self) -> "sparse.COO | np.ndarray":
         """The row-normalized backward weight matrix (target → source)."""
-        if self._bwd.weights is None:
-            self._bwd.weights = _row_normalize(_transpose_weights(self._areas))
-        return self._bwd.weights
+        return _row_normalize(_transpose_weights(self._areas))
 
-    def _apply_matrix(
-        self,
-        cache: _DirectionCache,
-        weights: "sparse.COO | np.ndarray",
-    ) -> "sparse.COO | np.ndarray":
-        """The transposed, index-sorted weight matrix used for ``data @ W``
-        matmul — avoiding sparse's per-call ``.T`` + ``_sort_indices``."""
-        if cache.apply is None:
-            cache.apply = _transpose_weights(weights, sort=True)
-        return cache.apply
+    @cached_property
+    def _forward_apply(self) -> "sparse.COO | np.ndarray":
+        # Transposed + index-sorted once so the matmul in _apply_core is
+        # (..., n_src) @ (n_src, n_dst) with no per-call sort.
+        return _transpose_weights(self.forward_weights, sort=True)
 
-    def _coverage_for(
-        self,
-        cache: _DirectionCache,
-        areas: "sparse.COO | np.ndarray",
-    ) -> np.ndarray:
-        """Boolean ``(n_dst,)`` mask: which destination cells have any source
-        overlap. Uncovered cells produce NaN at apply time."""
-        if cache.coverage is None:
-            cache.coverage = _coverage_mask(areas)
-        return cache.coverage
+    @cached_property
+    def _backward_apply(self) -> "sparse.COO | np.ndarray":
+        return _transpose_weights(self.backward_weights, sort=True)
+
+    @cached_property
+    def _forward_coverage(self) -> np.ndarray:
+        return _coverage_mask(self._areas)
+
+    @cached_property
+    def _backward_coverage(self) -> np.ndarray:
+        return _coverage_mask(_transpose_weights(self._areas))
 
     def regrid(
         self,
@@ -290,8 +189,8 @@ class ConservativeRegridder:
         """Regrid ``data`` forward (source → target)."""
         return _apply_stored_weights(
             data,
-            apply_weights=self._apply_matrix(self._fwd, self.forward_weights),
-            coverage=self._coverage_for(self._fwd, self._areas),
+            apply_weights=self._forward_apply,
+            coverage=self._forward_coverage,
             src_dims=self._src_dims,
             dst_dims=self._dst_dims,
             src_shape=self._src_shape,
@@ -313,7 +212,9 @@ class ConservativeRegridder:
 
     def transpose(self) -> "ConservativeRegridder":
         """Return the backward regridder (target → source), sharing the
-        underlying area matrix and both cached weight matrices."""
+        underlying area matrix and any already-computed cached weight
+        matrices (forward on the transposed regridder is backward on the
+        original, and vice versa)."""
         new = object.__new__(ConservativeRegridder)
         new.x_coord = self.x_coord
         new.y_coord = self.y_coord
@@ -325,9 +226,17 @@ class ConservativeRegridder:
         new._areas = _transpose_weights(self._areas)
         new._source_coords = self._target_coords
         new._target_coords = self._source_coords
-        # Forward on the transposed regridder is backward on the original.
-        new._fwd = self._bwd
-        new._bwd = self._fwd
+        swap = {
+            "forward_weights": "backward_weights",
+            "backward_weights": "forward_weights",
+            "_forward_apply": "_backward_apply",
+            "_backward_apply": "_forward_apply",
+            "_forward_coverage": "_backward_coverage",
+            "_backward_coverage": "_forward_coverage",
+        }
+        for src, dst in swap.items():
+            if src in self.__dict__:
+                new.__dict__[dst] = self.__dict__[src]
         return new
 
     @property
@@ -344,23 +253,6 @@ class ConservativeRegridder:
             f"dst_dims={self._dst_dims}, {shape[0]}x{shape[1]}, {nnz_str})"
         )
 
-    def metadata(self) -> RegridderMetadata:
-        """Return the :class:`RegridderMetadata` that :meth:`to_netcdf` would
-        write — useful for inspection without touching disk."""
-        return RegridderMetadata(
-            x_coord=self.x_coord,
-            y_coord=self.y_coord,
-            spherical=self.spherical,
-            src_dims=tuple(str(d) for d in self._src_dims),
-            dst_dims=tuple(str(d) for d in self._dst_dims),
-            src_shape=self._src_shape,
-            dst_shape=self._dst_shape,
-            source_x_range=_coord_range(self._source_coords, self.x_coord),
-            source_y_range=_coord_range(self._source_coords, self.y_coord),
-            target_x_range=_coord_range(self._target_coords, self.x_coord),
-            target_y_range=_coord_range(self._target_coords, self.y_coord),
-        )
-
     def to_netcdf(self, path: str | Path, engine: NetcdfEngine = None) -> None:
         """Save the weight matrix and reproducibility metadata to a netCDF file.
 
@@ -368,8 +260,8 @@ class ConservativeRegridder:
 
         - root dataset: the sparse area matrix stored as three 1D variables
           ``_coo_row``, ``_coo_col``, ``_coo_data`` (``shape=(n_dst, n_src)``
-          carried on root-dataset attributes), plus :class:`RegridderMetadata`
-          fields as attributes.
+          carried on root-dataset attributes), plus the regridder metadata as
+          root attributes.
         - ``/source_coords`` group: coord-only Dataset capturing the source grid.
         - ``/target_coords`` group: coord-only Dataset capturing the target grid.
 
@@ -385,7 +277,7 @@ class ConservativeRegridder:
                 "_coo_data": (("nnz",), data),
             },
             attrs={
-                **self.metadata().to_attrs(),
+                **_metadata_attrs(self),
                 "n_dst": int(shape[0]),
                 "n_src": int(shape[1]),
             },
@@ -415,14 +307,7 @@ class ConservativeRegridder:
             row = np.asarray(ds_weights["_coo_row"].values)
             col = np.asarray(ds_weights["_coo_col"].values)
             data = np.asarray(ds_weights["_coo_data"].values)
-        meta = RegridderMetadata.from_attrs(attrs)
-        if meta.schema_version != _SCHEMA_VERSION:
-            msg = (
-                f"regridder file at {path} uses schema version "
-                f"{meta.schema_version}; this xarray-regrid understands "
-                f"{_SCHEMA_VERSION}. Upgrade xarray-regrid or re-save."
-            )
-            raise ValueError(msg)
+        meta = _metadata_from_attrs(attrs, path)
 
         with xr.open_dataset(path, group="source_coords", engine=engine) as g:
             source_coords = g.load()
@@ -433,13 +318,7 @@ class ConservativeRegridder:
             areas=_coo_from_components(row, col, data, (n_dst, n_src)),
             source_coords=source_coords,
             target_coords=target_coords,
-            src_dims=meta.src_dims,
-            dst_dims=meta.dst_dims,
-            src_shape=meta.src_shape,
-            dst_shape=meta.dst_shape,
-            x_coord=meta.x_coord,
-            y_coord=meta.y_coord,
-            spherical=meta.spherical,
+            **meta,
         )
 
     @classmethod
@@ -471,8 +350,6 @@ class ConservativeRegridder:
         instance._areas = areas
         instance._source_coords = source_coords
         instance._target_coords = target_coords
-        instance._fwd = _DirectionCache()
-        instance._bwd = _DirectionCache()
         return instance
 
     @classmethod
@@ -483,6 +360,7 @@ class ConservativeRegridder:
         source_dim: str = "cell",
         target_dim: str = "cell",
         target_coords: xr.Dataset | None = None,
+        periodic: bool = False,
         n_threads: int | None = None,
     ) -> "ConservativeRegridder":
         """Build a regridder from explicit shapely polygon arrays.
@@ -501,6 +379,9 @@ class ConservativeRegridder:
             target_coords: Optional xr.Dataset providing coordinate variables
                 along ``target_dim`` (and any auxiliary coords) to reattach on
                 the output. If None, the output is given a bare integer index.
+            periodic: Treat polygon x coordinates as longitudes on a 360-degree
+                periodic axis, so polygons that cross the antimeridian are
+                unwrapped before intersection.
             n_threads: Thread count for GEOS intersection.
 
         Returns:
@@ -510,7 +391,6 @@ class ConservativeRegridder:
         Intersection geometry is planar in the input polygons' coordinate
         space. If the polygons represent lat/lon cells, project them into an
         equal-area CRS first (or use the structured path with ``spherical=True``).
-        Polygons that cross the antimeridian must be split beforehand.
         """
         _check_shapely()
         src_polys = np.asarray(source_polygons)
@@ -521,6 +401,11 @@ class ConservativeRegridder:
         if dst_polys.ndim != 1:
             msg = "target_polygons must be a 1D array of shapely Polygons"
             raise ValueError(msg)
+        if periodic:
+            src_polys = _normalize_periodic_polygons(src_polys)
+            dst_polys = _normalize_periodic_polygons(
+                dst_polys, reference=_polygon_reference_x(src_polys)
+            )
 
         src_grid = _Grid(
             polys=src_polys,
@@ -557,6 +442,7 @@ def polygons_from_coords(
     x: np.ndarray,
     y: np.ndarray,
     spherical: bool = False,
+    periodic: bool = False,
 ) -> np.ndarray:
     """Build a 1D array of shapely cell polygons from 1D or 2D center coords.
 
@@ -570,6 +456,9 @@ def polygons_from_coords(
         spherical: If True, apply a cylindrical equal-area projection to 1D
             lat/lon (degrees) before building rectangles — matches the
             structured-grid ``spherical=True`` path.
+        periodic: Treat x coordinates as longitudes on a 360-degree periodic
+            axis, so cells that cross the antimeridian are unwrapped before
+            polygon construction.
 
     Returns:
         A 1D numpy array of shapely Polygons in row-major (y, x) order.
@@ -577,6 +466,8 @@ def polygons_from_coords(
     _check_shapely()
     x = np.asarray(x)
     y = np.asarray(y)
+    if periodic:
+        x = _unwrap_longitude(x)
     if spherical:
         if x.ndim != 1 or y.ndim != 1:
             msg = "spherical=True requires 1D lat/lon arrays"
@@ -760,6 +651,148 @@ def _coo_from_components(
     return dense
 
 
+def _metadata_attrs(regridder: ConservativeRegridder) -> dict[str, Any]:
+    attrs: dict[str, Any] = {
+        "x_coord": regridder.x_coord,
+        "y_coord": regridder.y_coord,
+        "spherical": int(regridder.spherical),
+        "src_dims": [str(d) for d in regridder._src_dims],
+        "dst_dims": [str(d) for d in regridder._dst_dims],
+        "src_shape": list(regridder._src_shape),
+        "dst_shape": list(regridder._dst_shape),
+        "xarray_regrid_version": _package_version(),
+        "created": datetime.now(tz=timezone.utc).isoformat(),
+        "schema_version": _SCHEMA_VERSION,
+    }
+    for name, value in {
+        "source_x_range": _coord_range(regridder._source_coords, regridder.x_coord),
+        "source_y_range": _coord_range(regridder._source_coords, regridder.y_coord),
+        "target_x_range": _coord_range(regridder._target_coords, regridder.x_coord),
+        "target_y_range": _coord_range(regridder._target_coords, regridder.y_coord),
+    }.items():
+        if value is not None:
+            attrs[name] = list(value)
+    return attrs
+
+
+def _metadata_from_attrs(attrs: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Parse the kwargs needed by :meth:`ConservativeRegridder._from_state` out
+    of netCDF root attributes, validating ``schema_version``."""
+    schema_version = int(attrs.get("schema_version", 0))
+    if schema_version != _SCHEMA_VERSION:
+        msg = (
+            f"regridder file at {path} uses schema version {schema_version}; "
+            f"this xarray-regrid understands {_SCHEMA_VERSION}. "
+            "Upgrade xarray-regrid or re-save."
+        )
+        raise ValueError(msg)
+
+    return {
+        "x_coord": str(attrs["x_coord"]),
+        "y_coord": str(attrs["y_coord"]),
+        "spherical": bool(int(attrs["spherical"])),
+        "src_dims": tuple(str(d) for d in np.atleast_1d(attrs["src_dims"])),
+        "dst_dims": tuple(str(d) for d in np.atleast_1d(attrs["dst_dims"])),
+        "src_shape": tuple(int(s) for s in np.atleast_1d(attrs["src_shape"])),
+        "dst_shape": tuple(int(s) for s in np.atleast_1d(attrs["dst_shape"])),
+    }
+
+
+def _normalize_longitude_coords(
+    source: xr.DataArray | xr.Dataset,
+    target: xr.Dataset,
+    x_coord: str,
+) -> tuple[xr.DataArray | xr.Dataset, xr.Dataset]:
+    """Unwrap x coordinates across the antimeridian so source and target share
+    a contiguous longitude frame. No-op when the coord isn't present on both
+    objects or doesn't look like a longitude."""
+    if x_coord not in source.coords or x_coord not in target.coords:
+        return source, target
+
+    source_x = np.asarray(source[x_coord].values)
+    target_x = np.asarray(target[x_coord].values)
+    if not _looks_like_longitude(source_x) and not _looks_like_longitude(target_x):
+        return source, target
+
+    source_x = _unwrap_longitude(source_x)
+    target_x = _align_longitude(_unwrap_longitude(target_x), source_x)
+    return (
+        utils.update_coord(source, x_coord, source_x),
+        cast(xr.Dataset, utils.update_coord(target, x_coord, target_x)),
+    )
+
+
+def _looks_like_longitude(values: np.ndarray) -> bool:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return False
+    return bool(finite.min() >= -360.0 and finite.max() <= 360.0)
+
+
+def _unwrap_longitude(values: np.ndarray) -> np.ndarray:
+    radians = np.deg2rad(np.asarray(values, dtype=float))
+    for axis in range(radians.ndim):
+        radians = np.unwrap(radians, axis=axis)
+    return np.rad2deg(radians)
+
+
+def _align_longitude(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    if values.size == 0 or reference.size == 0:
+        return values
+    offset = 360.0 * round((np.nanmean(reference) - np.nanmean(values)) / 360.0)
+    return values + offset
+
+
+def _normalize_periodic_polygons(
+    polygons: np.ndarray, reference: float | None = None
+) -> np.ndarray:
+    normalized = []
+    current_reference = reference
+    for polygon in polygons:
+        new_polygon = _unwrap_polygon(polygon)
+        center = _polygon_reference_x(np.array([new_polygon], dtype=object))
+        if current_reference is None:
+            current_reference = center
+        offset = 360.0 * round((current_reference - center) / 360.0)
+        if offset:
+            new_polygon = affinity.translate(new_polygon, xoff=offset)
+        normalized.append(new_polygon)
+    return np.array(normalized, dtype=object)
+
+
+def _polygon_reference_x(polygons: np.ndarray) -> float:
+    bounds = shapely.bounds(polygons)
+    centers = 0.5 * (bounds[:, 0] + bounds[:, 2])
+    return float(np.nanmean(centers))
+
+
+def _unwrap_polygon(polygon: Any) -> Any:
+    if polygon.is_empty:
+        return polygon
+    if polygon.geom_type == "Polygon":
+        exterior = _unwrap_ring(np.asarray(polygon.exterior.coords))
+        holes = [_unwrap_ring(np.asarray(ring.coords)) for ring in polygon.interiors]
+        return shapely.Polygon(exterior, holes)
+    if polygon.geom_type == "MultiPolygon":
+        return shapely.MultiPolygon([_unwrap_polygon(part) for part in polygon.geoms])
+    return polygon
+
+
+def _unwrap_ring(ring: np.ndarray) -> np.ndarray:
+    new_ring = np.asarray(ring, dtype=float).copy()
+    offset = 0.0
+    for i in range(1, new_ring.shape[0]):
+        x = new_ring[i, 0] + offset
+        step = x - new_ring[i - 1, 0]
+        if step > 180.0:
+            offset -= 360.0
+        elif step < -180.0:
+            offset += 360.0
+        new_ring[i, 0] += offset
+    return new_ring
+
+
 def _coord_range(ds: xr.Dataset, coord_name: str) -> tuple[float, float] | None:
     """Return ``(min, max)`` of a coord, or ``None`` when it isn't on the
     Dataset (e.g., the integer-index stub emitted by ``from_polygons``)."""
@@ -868,25 +901,12 @@ def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid"
     if lon_centers.size < 2 or lat_centers.size < 2:
         msg = "spherical mode requires at least two cells per dimension"
         raise ValueError(msg)
-    lat_edges_deg = np.clip(_infer_1d_edges(lat_centers), -90.0, 90.0)
-    lon_edges_deg = _infer_1d_edges(lon_centers)
+    lat_edges_deg = np.clip(utils.infer_1d_edges(lat_centers), -90.0, 90.0)
+    lon_edges_deg = utils.infer_1d_edges(lon_centers)
     return _rect_grid_from_edges(
         np.deg2rad(lon_edges_deg),
         np.sin(np.deg2rad(lat_edges_deg)),
     )
-
-
-def _infer_1d_edges(centers: np.ndarray) -> np.ndarray:
-    """Return cell edges from 1D centers: midpoints between consecutive
-    centers, with symmetric reflection for the two outer bounds."""
-    c = np.asarray(centers, dtype=float)
-    if c.size < 2:
-        msg = "need at least two centers to infer cell edges"
-        raise ValueError(msg)
-    mids = 0.5 * (c[:-1] + c[1:])
-    left = 2 * c[0] - mids[0]
-    right = 2 * c[-1] - mids[-1]
-    return np.concatenate([[left], mids, [right]])
 
 
 def _infer_2d_corners(xc: np.ndarray, yc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -957,8 +977,8 @@ def _build_grid(xc: np.ndarray, yc: np.ndarray) -> _Grid:
     """
     _check_shapely()
     if xc.ndim == 1 and yc.ndim == 1:
-        xe = _infer_1d_edges(xc.astype(float))
-        ye = _infer_1d_edges(yc.astype(float))
+        xe = utils.infer_1d_edges(xc.astype(float))
+        ye = utils.infer_1d_edges(yc.astype(float))
         return _rect_grid_from_edges(xe, ye)
     if xc.ndim == 2 and yc.ndim == 2:
         xcorn, ycorn = _infer_2d_corners(xc, yc)
