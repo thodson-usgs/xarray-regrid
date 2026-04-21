@@ -362,6 +362,7 @@ class ConservativeRegridder:
         target_coords: xr.Dataset | None = None,
         periodic: bool = False,
         n_threads: int | None = None,
+        predicate_filter: bool = True,
     ) -> "ConservativeRegridder":
         """Build a regridder from explicit shapely polygon arrays.
 
@@ -383,6 +384,13 @@ class ConservativeRegridder:
                 periodic axis, so polygons that cross the antimeridian are
                 unwrapped before intersection.
             n_threads: Thread count for GEOS intersection.
+            predicate_filter: If True (default), the STRtree candidate query
+                filters by GEOS ``intersects``. Safe for arbitrary polygons
+                including thin/diagonal shapes with loose bboxes. Set False
+                when your polygons have tight bboxes (low aspect ratio,
+                roughly axis-aligned) to skip the predicate and let the
+                ``area > 0`` filter drop false positives — usually faster
+                in that case, pathological otherwise.
 
         Returns:
             A ``ConservativeRegridder`` that accepts data with ``source_dim``
@@ -425,7 +433,12 @@ class ConservativeRegridder:
             else xr.Dataset(coords={target_dim: np.arange(n_dst)})
         )
         return cls._from_state(
-            areas=_build_intersection_areas(src_grid, dst_grid, n_threads=n_threads),
+            areas=_build_intersection_areas(
+                src_grid,
+                dst_grid,
+                n_threads=n_threads,
+                predicate_filter=predicate_filter,
+            ),
             source_coords=xr.Dataset(coords={source_dim: np.arange(n_src)}),
             target_coords=tgt_ds,
             src_dims=(source_dim,),
@@ -995,7 +1008,11 @@ def _build_grid(xc: np.ndarray, yc: np.ndarray) -> _Grid:
 
 
 def _build_intersection_areas(
-    src: _Grid, dst: _Grid, n_threads: int | None = None
+    src: _Grid,
+    dst: _Grid,
+    n_threads: int | None = None,
+    *,
+    predicate_filter: bool = False,
 ) -> "sparse.COO | np.ndarray":
     """Build the (n_dst, n_src) raw area-intersection matrix ``A[i, j] =
     area(dst_i ∩ src_j)``.
@@ -1005,13 +1022,24 @@ def _build_intersection_areas(
 
     When both grids are rectilinear (axis-aligned rectangles) intersection
     areas are computed analytically from the bounds, skipping GEOS clipping.
+
+    ``predicate_filter=False`` (default) uses a bbox-only STRtree query and
+    relies on the ``area > 0`` filter below to drop bbox-false-positives.
+    For structured cells whose bboxes are tight (quadrilaterals) this is a
+    large win — the GEOS ``intersects`` predicate inside STRtree is much
+    more expensive than the extra no-op intersections it avoids. Set
+    ``predicate_filter=True`` for user-supplied polygons with loose bboxes
+    (long, thin, diagonal shapes) where the predicate pays for itself.
     """
     _check_shapely()
     n_dst = len(dst.polys)
     n_src = len(src.polys)
 
     tree = STRtree(src.polys)
-    pairs = tree.query(dst.polys, predicate="intersects")
+    if predicate_filter:
+        pairs = tree.query(dst.polys, predicate="intersects")
+    else:
+        pairs = tree.query(dst.polys)
     dst_idx = np.asarray(pairs[0])
     src_idx = np.asarray(pairs[1])
 
