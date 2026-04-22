@@ -1147,10 +1147,11 @@ def _intersection_areas_threaded(
     _check_shapely()
     n = len(a)
     if n_threads is None:
-        n_threads = min(os.cpu_count() or 1, 8)
-        # Amortize thread-pool overhead only when there's meaningful work.
-        if n < 50_000:
-            n_threads = 1
+        # Below ~1k pairs the pool spin-up (~0.3 ms) dominates sub-ms work.
+        # Above that, scaling is near-linear with logical cores — shapely
+        # releases the GIL inside its GEOS ufuncs. Cap at 16 to avoid
+        # oversubscription on unusually wide machines.
+        n_threads = 1 if n < 1_000 else min(os.cpu_count() or 1, 16)
     if n_threads <= 1 or n == 0:
         return shapely.area(shapely.intersection(a, b))
 
