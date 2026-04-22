@@ -320,6 +320,32 @@ def test_from_polygons_basic():
     assert out.sizes["cell"] == tgt_polys.size
 
 
+def test_from_polygons_attaches_target_aux_coords():
+    src_polys = _box_polygons()
+    tgt_polys = polygons_from_coords(
+        np.linspace(-180, 180, 12, endpoint=False) + 15,
+        np.linspace(-90, 90, 6, endpoint=False) + 15,
+    )
+    region_id = np.arange(tgt_polys.size) + 100
+    target_coords = xr.Dataset(
+        coords={
+            "cell": np.arange(tgt_polys.size),
+            "region_id": ("cell", region_id),
+        }
+    )
+    rgr = ConservativeRegridder.from_polygons(
+        src_polys,
+        tgt_polys,
+        source_dim="face",
+        target_dim="cell",
+        target_coords=target_coords,
+    )
+    da = xr.DataArray(np.arange(src_polys.size, dtype=np.float64), dims=("face",))
+    out = rgr.regrid(da)
+    assert "region_id" in out.coords
+    np.testing.assert_array_equal(out["region_id"].values, region_id)
+
+
 def test_from_polygons_periodic_antimeridian():
     src_polys = np.array(
         [shapely.Polygon([(175, -5), (-175, -5), (-175, 5), (175, 5)])],

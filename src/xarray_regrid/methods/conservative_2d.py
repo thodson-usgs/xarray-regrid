@@ -401,18 +401,14 @@ class ConservativeRegridder:
         equal-area CRS first (or use the structured path with ``spherical=True``).
         """
         _check_shapely()
-        src_polys = np.asarray(source_polygons)
-        dst_polys = np.asarray(target_polygons)
-        if src_polys.ndim != 1:
-            msg = "source_polygons must be a 1D array of shapely Polygons"
-            raise ValueError(msg)
-        if dst_polys.ndim != 1:
-            msg = "target_polygons must be a 1D array of shapely Polygons"
-            raise ValueError(msg)
+        src_polys = _as_1d_polygon_array(source_polygons, name="source_polygons")
+        dst_polys = _as_1d_polygon_array(target_polygons, name="target_polygons")
         if periodic:
             src_polys = _normalize_periodic_polygons(src_polys)
+            src_reference = _polygon_reference_x(src_polys)
             dst_polys = _normalize_periodic_polygons(
-                dst_polys, reference=_polygon_reference_x(src_polys)
+                dst_polys,
+                reference=src_reference if np.isfinite(src_reference) else None,
             )
 
         src_grid = _Grid(
@@ -753,7 +749,11 @@ def _unwrap_longitude(values: np.ndarray) -> np.ndarray:
 def _align_longitude(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
     if values.size == 0 or reference.size == 0:
         return values
-    offset = 360.0 * round((np.nanmean(reference) - np.nanmean(values)) / 360.0)
+    reference_center = _finite_mean(reference)
+    values_center = _finite_mean(values)
+    if reference_center is None or values_center is None:
+        return values
+    offset = _periodic_offset(reference_center, values_center)
     return values + offset
 
 
@@ -764,11 +764,14 @@ def _normalize_periodic_polygons(
     current_reference = reference
     for polygon in polygons:
         new_polygon = _unwrap_polygon(polygon)
-        center = _polygon_reference_x(np.array([new_polygon], dtype=object))
-        if current_reference is None:
+        center = _polygon_center_x(new_polygon)
+        if current_reference is None and np.isfinite(center):
             current_reference = center
-        offset = 360.0 * round((current_reference - center) / 360.0)
-        if offset:
+        if current_reference is None:
+            normalized.append(new_polygon)
+            continue
+        offset = _periodic_offset(current_reference, center)
+        if offset != 0.0:
             new_polygon = affinity.translate(new_polygon, xoff=offset)
         normalized.append(new_polygon)
     return np.array(normalized, dtype=object)
@@ -777,7 +780,35 @@ def _normalize_periodic_polygons(
 def _polygon_reference_x(polygons: np.ndarray) -> float:
     bounds = shapely.bounds(polygons)
     centers = 0.5 * (bounds[:, 0] + bounds[:, 2])
-    return float(np.nanmean(centers))
+    center = _finite_mean(centers)
+    return float("nan") if center is None else center
+
+
+def _polygon_center_x(polygon: Any) -> float:
+    minx, _, maxx, _ = polygon.bounds
+    return 0.5 * (float(minx) + float(maxx))
+
+
+def _periodic_offset(reference: float, value: float) -> float:
+    if not np.isfinite(reference) or not np.isfinite(value):
+        return 0.0
+    return 360.0 * round((reference - value) / 360.0)
+
+
+def _finite_mean(values: np.ndarray) -> float | None:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+    return float(finite.mean())
+
+
+def _as_1d_polygon_array(polygons: np.ndarray, *, name: str) -> np.ndarray:
+    arr = np.asarray(polygons)
+    if arr.ndim != 1:
+        msg = f"{name} must be a 1D array of shapely Polygons"
+        raise ValueError(msg)
+    return arr
 
 
 def _unwrap_polygon(polygon: Any) -> Any:
@@ -1224,14 +1255,15 @@ def _assign_target_coords(
     x_coord: str,
     y_coord: str,
 ) -> xr.DataArray | xr.Dataset:
-    """Attach the target dataset's dim coords and auxiliary lat/lon coords."""
+    """Attach target coordinates that name a spatial axis or live on the
+    output spatial dims. Scalar coords (``dims == ()``) on the target also
+    ride along, since they represent per-regrid metadata (e.g. a pinned
+    time stamp on the target template)."""
+    dst_dim_set = set(dst_dims)
     new_coords: dict[Hashable, Any] = {}
-    for d in dst_dims:
-        if d in target_ds.coords:
-            new_coords[d] = target_ds[d]
-    for name in (x_coord, y_coord):
-        if name in target_ds.coords and name not in new_coords:
-            new_coords[name] = target_ds[name]
+    for name, coord in target_ds.coords.items():
+        if name in (x_coord, y_coord) or set(coord.dims).issubset(dst_dim_set):
+            new_coords[name] = coord
     if new_coords:
         obj = obj.assign_coords(new_coords)
     return obj
