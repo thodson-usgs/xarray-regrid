@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ except ImportError:
     xesmf = None
 
 import xarray_regrid
+from xarray_regrid.methods import interp as _cubic_interp
 
 DATA_PATH = Path(__file__).parent.parent / "docs" / "notebooks" / "benchmarks" / "data"
 
@@ -298,3 +300,91 @@ class TestCoordOrder:
         )
         assert_array_equal(ds_regrid["latitude"], sample_grid_ds["latitude"])
         assert_array_equal(ds_regrid["longitude"], sample_grid_ds["longitude"])
+
+
+# --- factored cubic path (interp.py) --------------------------------------
+
+
+def _cubic_grid(ny, nx):
+    """Cell-centered lat/lon grid, used as source and target in the tests."""
+    lat = np.linspace(-90, 90, ny, endpoint=False) + 90 / ny
+    lon = np.linspace(-180, 180, nx, endpoint=False) + 180 / nx
+    return lat, lon
+
+
+def test_cubic_factored_matches_nd_path():
+    """On rectilinear grids where target is inside source, the factored
+    cubic path and the N-D cubic path agree to noise level (relRMS ~1e-5)."""
+    src_lat, src_lon = _cubic_grid(60, 120)
+    tgt_lat, tgt_lon = _cubic_grid(30, 60)
+    rng = np.random.default_rng(0)
+    src = xr.DataArray(
+        rng.standard_normal((60, 120)),
+        dims=("latitude", "longitude"),
+        coords={"latitude": src_lat, "longitude": src_lon},
+    )
+    tgt_ds = xr.Dataset(coords={"latitude": tgt_lat, "longitude": tgt_lon})
+
+    # Factored (gate passes because 30->60 cell-centered at coarser step is
+    # strictly inside the finer-step source)
+    out_fac = _cubic_interp.interp_regrid(src, tgt_ds, "cubic")
+
+    # N-D (force fallback); silence the expected fallback warning since
+    # we're deliberately triggering it to compare outputs.
+    saved = _cubic_interp._target_within_source
+    _cubic_interp._target_within_source = lambda *_args, **_kw: False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            out_nd = _cubic_interp.interp_regrid(src, tgt_ds, "cubic")
+    finally:
+        _cubic_interp._target_within_source = saved
+
+    diff = np.asarray(out_fac.values - out_nd.values)
+    rms = float(np.sqrt(np.nanmean(diff**2)))
+    rel = rms / float(np.sqrt(np.nanmean(np.asarray(out_nd.values) ** 2)))
+    assert rel < 1e-4, f"factored and N-D diverged: relRMS={rel:.3e}"
+
+
+def test_cubic_fallback_warns_when_target_exceeds_source():
+    """Factored path cannot handle out-of-bounds target points (scipy's
+    1D cubic would propagate NaN across the batch). We fall back to the
+    N-D path and emit a RuntimeWarning so callers notice the slowdown."""
+    # Source centers [-87, 87]; target centers [-89.25, 89.25] extend beyond.
+    src_lat, src_lon = _cubic_grid(30, 60)
+    tgt_lat, tgt_lon = _cubic_grid(120, 240)
+    rng = np.random.default_rng(0)
+    src = xr.DataArray(
+        rng.standard_normal((30, 60)),
+        dims=("latitude", "longitude"),
+        coords={"latitude": src_lat, "longitude": src_lon},
+    )
+    tgt_ds = xr.Dataset(coords={"latitude": tgt_lat, "longitude": tgt_lon})
+
+    with pytest.warns(RuntimeWarning, match="scipy N-D"):
+        out = _cubic_interp.interp_regrid(src, tgt_ds, "cubic")
+    # Output should be finite except at the out-of-bounds boundary cells —
+    # most of the interior interpolates successfully via the N-D fallback.
+    assert np.isfinite(out.values).sum() > 0.9 * out.size
+
+
+def test_cubic_factored_tolerates_tiny_float_drift():
+    """When target bounds equal source bounds up to floating-point rounding,
+    we should still take the factored path instead of falling back."""
+    src_lat, src_lon = _cubic_grid(60, 120)
+    # Target bounds are the same centers but after a float round-trip.
+    tgt_lat = src_lat.astype(np.float32).astype(np.float64)
+    tgt_lon = src_lon.astype(np.float32).astype(np.float64)
+    rng = np.random.default_rng(0)
+    src = xr.DataArray(
+        rng.standard_normal((60, 120)),
+        dims=("latitude", "longitude"),
+        coords={"latitude": src_lat, "longitude": src_lon},
+    )
+    tgt_ds = xr.Dataset(coords={"latitude": tgt_lat, "longitude": tgt_lon})
+
+    # Turn the fallback warning into an error so we notice if the tolerance
+    # stops absorbing float32 round-trip drift.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _cubic_interp.interp_regrid(src, tgt_ds, "cubic")
