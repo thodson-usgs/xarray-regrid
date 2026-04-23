@@ -627,6 +627,37 @@ def test_from_netcdf_rejects_unknown_schema(tmp_path):
         ConservativeRegridder.from_netcdf(path)
 
 
+def test_blockwise_matches_regrid():
+    """``regrid_blockwise`` must match ``regrid`` numerically for a typical
+    rectilinear case across a few block layouts."""
+    da = _rect_da(nt=3)
+    target = _rect_target(ny=24, nx=48)
+    regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
+    ref = regridder.regrid(da)
+    for chunks in (None, {"y": 8}, {"y": 8, "x": 16}, {"y": 1, "x": 1}):
+        got = regridder.regrid_blockwise(da, target_chunks=chunks)
+        np.testing.assert_allclose(
+            got.transpose(*ref.dims).values, ref.values, atol=1e-12
+        )
+
+
+def test_blockwise_dask_input_is_lazy():
+    """Blockwise regrid of a time-chunked dask input stays lazy and
+    preserves time chunking on the output."""
+    pytest.importorskip("dask")
+    da = _rect_da(nt=4).chunk({"time": 2})
+    target = _rect_target(ny=12, nx=24)
+    regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
+    out = regridder.regrid_blockwise(da, target_chunks={"y": 6, "x": 12})
+    assert out.chunks is not None
+    # time chunking preserved from input
+    assert out.chunks[out.dims.index("time")] == (2, 2)
+    ref = regridder.regrid(da).compute()
+    np.testing.assert_allclose(
+        out.compute().transpose(*ref.dims).values, ref.values, atol=1e-12
+    )
+
+
 def test_regridder_transpose_curvilinear():
     """Transpose works when the target is a curvilinear grid with different
     dim names from the source."""

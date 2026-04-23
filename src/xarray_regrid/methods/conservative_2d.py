@@ -210,6 +210,41 @@ class ConservativeRegridder:
     ) -> xr.DataArray | xr.Dataset:
         return self.regrid(data, skipna=skipna, nan_threshold=nan_threshold)
 
+    def regrid_blockwise(
+        self,
+        data: xr.DataArray | xr.Dataset,
+        target_chunks: dict[Hashable, int] | None = None,
+        skipna: bool = True,
+        nan_threshold: float = 1.0,
+    ) -> xr.DataArray | xr.Dataset:
+        """Regrid forward using per-target-block matmul.
+
+        Unlike :meth:`regrid`, each target block pulls only the source cells
+        that contribute to it (identified from the sparse weight matrix), so
+        per-task source memory scales with the block's source footprint
+        rather than the full source plane. Useful when the source is chunked
+        spatially and the full plane doesn't fit in worker memory.
+
+        ``target_chunks`` maps target dim names to chunk sizes, e.g.
+        ``{"latitude": 90, "longitude": 180}``. Dims not listed default to
+        one chunk.
+        """
+        return _apply_blockwise(
+            data,
+            apply_weights=self._forward_apply,
+            coverage=self._forward_coverage,
+            src_dims=self._src_dims,
+            dst_dims=self._dst_dims,
+            src_shape=self._src_shape,
+            dst_shape=self._dst_shape,
+            target_coords=self._target_coords,
+            x_coord=self.x_coord,
+            y_coord=self.y_coord,
+            skipna=skipna,
+            nan_threshold=nan_threshold,
+            target_chunks=target_chunks or {},
+        )
+
     def transpose(self) -> "ConservativeRegridder":
         """Return the backward regridder (target → source), sharing the
         underlying area matrix and any already-computed cached weight
@@ -603,6 +638,133 @@ def _apply_stored_weights(
         keep_attrs=True,
     )
 
+    result = _assign_target_coords(result, target_coords, dst_dims, x_coord, y_coord)
+    return result
+
+
+def _resolve_chunks(size: int, chunk: int) -> tuple[int, ...]:
+    """Split ``size`` into chunks of at most ``chunk`` elements (last may be
+    smaller). ``chunk <= 0`` or ``chunk >= size`` returns a single chunk."""
+    if chunk <= 0 or chunk >= size:
+        return (size,)
+    full, rem = divmod(size, chunk)
+    return (chunk,) * full + ((rem,) if rem else ())
+
+
+def _block_weights(
+    apply_weights: Any, dst_flat: np.ndarray
+) -> tuple[np.ndarray, Any]:
+    """Given a (n_src, n_dst) weight matrix and a list of target flat
+    indices, return (src_rows, sub_weights) where ``sub_weights`` has shape
+    ``(len(src_rows), len(dst_flat))`` and ``src_rows`` are the unique source
+    indices with any nonzero in the block."""
+    sub_cols = apply_weights[:, dst_flat]
+    if _HAS_SPARSE and isinstance(sub_cols, sparse.COO):
+        src_rows = np.unique(sub_cols.coords[0]) if sub_cols.nnz else np.empty(0, dtype=np.int64)
+    else:
+        src_rows = np.where(np.any(sub_cols != 0, axis=1))[0]
+    return src_rows, sub_cols[src_rows, :]
+
+
+def _apply_blockwise(
+    data: xr.DataArray | xr.Dataset,
+    apply_weights: Any,
+    coverage: np.ndarray,
+    src_dims: tuple[Hashable, ...],
+    dst_dims: tuple[Hashable, ...],
+    src_shape: tuple[int, ...],
+    dst_shape: tuple[int, ...],
+    target_coords: xr.Dataset,
+    x_coord: str,
+    y_coord: str,
+    skipna: bool,
+    nan_threshold: float,
+    target_chunks: dict[Hashable, int],
+) -> xr.DataArray | xr.Dataset:
+    """Apply weights block-by-block across the target spatial dims.
+
+    For each target block, identify the subset of source cells that
+    contribute (via the sparse weight matrix), slice the input along those
+    indices, and matmul with the block-local weight submatrix. Output is a
+    dask-backed array concatenated along the target spatial dims; leading
+    dims keep the input's chunking.
+    """
+    if len(dst_dims) != 2:
+        msg = "regrid_blockwise currently supports only 2D target grids."
+        raise NotImplementedError(msg)
+
+    ny, nx = (int(target_coords.sizes[d]) for d in dst_dims)
+    y_chunks = _resolve_chunks(ny, int(target_chunks.get(dst_dims[0], ny)))
+    x_chunks = _resolve_chunks(nx, int(target_chunks.get(dst_dims[1], nx)))
+
+    # Stack source spatial dims → one flat axis so per-block .isel on
+    # arbitrary src indices is a single operation (and stays lazy on dask).
+    src_tokens = tuple(f"__src_{d}" for d in src_dims)
+    data_renamed = data.rename(dict(zip(src_dims, src_tokens, strict=True)))
+    stacked = "__src_flat"
+    data_flat = data_renamed.stack({stacked: src_tokens})
+
+    output_dtype = _result_dtype(data)
+
+    def _block_fn(
+        arr: np.ndarray,
+        sub_weights: Any,
+        coverage_block: np.ndarray,
+        block_shape: tuple[int, int],
+    ) -> np.ndarray:
+        return _apply_core(
+            arr,
+            apply_weights=sub_weights,
+            coverage=coverage_block,
+            coverage_all=bool(coverage_block.all()),
+            src_shape=(arr.shape[-1],),
+            dst_shape=block_shape,
+            skipna=skipna,
+            nan_threshold=nan_threshold,
+            output_dtype=output_dtype,
+        )
+
+    row_arrays = []
+    for by, y_chunk in enumerate(y_chunks):
+        y_start = sum(y_chunks[:by])
+        col_arrays = []
+        for bx, x_chunk in enumerate(x_chunks):
+            x_start = sum(x_chunks[:bx])
+            yy, xx = np.mgrid[y_start:y_start + y_chunk, x_start:x_start + x_chunk]
+            dst_flat = (yy * nx + xx).ravel()
+            src_rows, sub_weights = _block_weights(apply_weights, dst_flat)
+            coverage_block = coverage[dst_flat]
+            block_shape = (y_chunk, x_chunk)
+
+            if src_rows.size == 0:
+                # No source cells contribute; whole block is NaN.
+                sliced = data_flat.isel({stacked: slice(0, 1)})
+            else:
+                sliced = data_flat.isel({stacked: src_rows})
+
+            block_da = xr.apply_ufunc(
+                _block_fn,
+                sliced,
+                kwargs={
+                    "sub_weights": sub_weights,
+                    "coverage_block": coverage_block,
+                    "block_shape": block_shape,
+                },
+                input_core_dims=[[stacked]],
+                output_core_dims=[list(dst_dims)],
+                exclude_dims={stacked},
+                dask="parallelized",
+                output_dtypes=[output_dtype],
+                dask_gufunc_kwargs={
+                    "output_sizes": dict(zip(dst_dims, block_shape, strict=True)),
+                    "allow_rechunk": True,
+                },
+                keep_attrs=True,
+            )
+            col_arrays.append(block_da)
+        row_arrays.append(xr.concat(col_arrays, dim=dst_dims[1]))
+
+    result = xr.concat(row_arrays, dim=dst_dims[0])
     result = _assign_target_coords(result, target_coords, dst_dims, x_coord, y_coord)
     return result
 
