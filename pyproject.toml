@@ -60,6 +60,15 @@ benchmarking = [
   "pooch",
   "cftime",  # required for decode time of test netCDF files
 ]
+notebooks = [
+  # Extra dependencies needed to run docs/notebooks/demos/*.ipynb.
+  # Combine with [conservative-2d] and [accel] for the full demo set,
+  # e.g.: pip install "xarray-regrid[notebooks,conservative-2d,accel]"
+  "matplotlib",
+  "pooch",          # xr.tutorial.open_dataset backend
+  "geopandas",      # polygon regions demo
+  "geodatasets",    # ships the ncovr US county boundaries
+]
 dev = [
   "hatch",
   "ruff",
