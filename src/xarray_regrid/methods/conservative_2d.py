@@ -136,6 +136,12 @@ class ConservativeRegridder:
     Build once, apply to many fields via :meth:`regrid` (or by calling the
     regridder); ``.T`` gives the backward regridder. Forward and backward
     weight matrices are cached lazily. Requires ``shapely >= 2.0``.
+
+    The unnormalized cell-intersection area matrix
+    ``A[i, j] = area(target_i ∩ source_j)`` is exposed as ``self.areas``
+    (sparse ``(n_dst, n_src)`` if the ``sparse`` package is available, dense
+    otherwise) — useful for conservation diagnostics and per-cell coverage
+    analysis.
     """
 
     def __init__(
@@ -182,17 +188,17 @@ class ConservativeRegridder:
             areas = _remap_columns_for_axis_sort(
                 areas, src_x_sort_idx, self._src_shape, x_dim_index
             )
-        self._areas = areas
+        self.areas = areas
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
 
     @cached_property
     def _forward(self) -> _Direction:
-        return _Direction(self._areas)
+        return _Direction(self.areas)
 
     @cached_property
     def _backward(self) -> _Direction:
-        return _Direction(_transpose_weights(self._areas))
+        return _Direction(_transpose_weights(self.areas))
 
     @property
     def forward_weights(self) -> "sparse.COO | np.ndarray":
@@ -238,7 +244,7 @@ class ConservativeRegridder:
         forward Direction becomes the new's backward (and vice versa), so any
         already-computed weight matrices are reused, not recomputed."""
         new = type(self)._from_state(
-            areas=_transpose_weights(self._areas),
+            areas=_transpose_weights(self.areas),
             source_coords=self._target_coords,
             target_coords=self._source_coords,
             src_dims=self._dst_dims,
@@ -261,8 +267,8 @@ class ConservativeRegridder:
         return self.transpose()
 
     def __repr__(self) -> str:
-        nnz = getattr(self._areas, "nnz", None)
-        shape = getattr(self._areas, "shape", (None, None))
+        nnz = getattr(self.areas, "nnz", None)
+        shape = getattr(self.areas, "shape", (None, None))
         nnz_str = f"nnz={nnz}" if nnz is not None else "dense"
         return (
             f"ConservativeRegridder(src_dims={self._src_dims}, "
@@ -274,7 +280,7 @@ class ConservativeRegridder:
         Requires a group-aware engine (``netcdf4`` or ``h5netcdf``); ``engine``
         is forwarded to :func:`xarray.Dataset.to_netcdf`."""
         path = Path(path)
-        row, col, data, shape = _coo_components(self._areas)
+        row, col, data, shape = _coo_components(self.areas)
         ds_weights = xr.Dataset(
             {
                 "_coo_row": (("nnz",), row),
@@ -352,7 +358,7 @@ class ConservativeRegridder:
         instance._dst_dims = dst_dims
         instance._src_shape = src_shape
         instance._dst_shape = dst_shape
-        instance._areas = areas
+        instance.areas = areas
         instance._source_coords = source_coords
         instance._target_coords = target_coords
         return instance
@@ -664,9 +670,7 @@ def _normalize_longitude_coords(
         # aligns. A uniform offset can't reconcile cross-convention grids:
         # mean diff is exactly 180° and round() is banker's-rounded to 0.
         wrap_point = float((tgt_finite[0] + tgt_finite[-1] + 360.0) / 2.0)
-        source_x = np.where(
-            source_x < wrap_point - 360.0, source_x + 360.0, source_x
-        )
+        source_x = np.where(source_x < wrap_point - 360.0, source_x + 360.0, source_x)
         source_x = np.where(source_x > wrap_point, source_x - 360.0, source_x)
         diffs = np.diff(source_x)
         if not (np.all(diffs > 0) or np.all(diffs < 0)):

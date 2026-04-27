@@ -124,9 +124,7 @@ def test_cross_convention_longitude_alignment():
         dims=("latitude", "longitude"),
         coords={"latitude": [-30.0, 30.0], "longitude": src_vals_neg_x},
     )
-    target = xr.Dataset(
-        coords={"latitude": [-30.0, 30.0], "longitude": tgt_vals_neg}
-    )
+    target = xr.Dataset(coords={"latitude": [-30.0, 30.0], "longitude": tgt_vals_neg})
     expected = da.regrid.conservative(target).transpose("latitude", "longitude")
     out_planar = da.regrid.conservative_2d(
         target, x_coord="longitude", y_coord="latitude"
@@ -239,9 +237,9 @@ def test_regridder_T_preserves_weights():  # noqa: N802
     r = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
     rr = r.T.T
     # Same shape, same coords, same data.
-    assert r._areas.shape == rr._areas.shape
-    if hasattr(r._areas, "data"):
-        np.testing.assert_array_equal(r._areas.data, rr._areas.data)
+    assert r.areas.shape == rr.areas.shape
+    if hasattr(r.areas, "data"):
+        np.testing.assert_array_equal(r.areas.data, rr.areas.data)
 
 
 def test_regridder_shape_mismatch_raises():
@@ -436,7 +434,7 @@ def test_from_polygons_mass_conservation():
     out = rgr.regrid(da).values
     # Direct mass = sum_i s_i * (sum_j A_ij). Matches output if we multiply
     # output by target-covered area = sum_i A_ij.
-    areas = rgr._areas  # (n_tgt, n_src)
+    areas = rgr.areas  # (n_tgt, n_src)
     tgt_covered = areas.sum(axis=1).todense()
     valid = tgt_covered > 0
     direct = float((s * areas.sum(axis=0).todense()).sum())
