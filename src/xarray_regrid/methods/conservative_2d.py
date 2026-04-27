@@ -148,7 +148,9 @@ class ConservativeRegridder:
         n_threads: int | None = None,
     ) -> None:
         _check_shapely()
-        source_grid, target_grid = _normalize_longitude_coords(source, target, x_coord)
+        source_grid, target_grid, src_x_sort_idx = _normalize_longitude_coords(
+            source, target, x_coord
+        )
         src_dims = _spatial_dims(source_grid, x_coord, y_coord)
         dst_dims = _spatial_dims(target_grid, x_coord, y_coord)
         if not src_dims:
@@ -171,7 +173,16 @@ class ConservativeRegridder:
         self._dst_dims = dst_dims
         self._src_shape = tuple(int(source.sizes[d]) for d in src_dims)
         self._dst_shape = tuple(int(target.sizes[d]) for d in dst_dims)
-        self._areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
+        areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
+        if src_x_sort_idx is not None:
+            # Source x was sorted by _normalize_longitude_coords so polygon
+            # construction stayed monotone. Relabel matrix columns so column
+            # order matches the user's original (unsorted) data layout.
+            x_dim_index = src_dims.index(source[x_coord].dims[0])
+            areas = _remap_columns_for_axis_sort(
+                areas, src_x_sort_idx, self._src_shape, x_dim_index
+            )
+        self._areas = areas
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
 
@@ -614,31 +625,64 @@ def _normalize_longitude_coords(
     source: xr.DataArray | xr.Dataset,
     target: xr.Dataset,
     x_coord: str,
-) -> tuple[xr.DataArray | xr.Dataset, xr.Dataset]:
+) -> tuple[xr.DataArray | xr.Dataset, xr.Dataset, np.ndarray | None]:
     """Unwrap x coordinates across the antimeridian so source and target share
     a contiguous longitude frame. No-op when the coord isn't present on both
-    objects or doesn't look like a longitude."""
+    objects or doesn't look like a longitude.
+
+    For 1D rectilinear longitudes on both sides this mirrors the per-value
+    wrap done by :func:`xarray_regrid.utils.format_lon` for the axis-factored
+    path, which is what makes a source on ``[0, 360]`` align with a target on
+    ``[-180, 180]`` (and vice versa). If wrapping breaks source monotonicity
+    the source coord is sorted in place; the caller is expected to remap the
+    area-matrix columns by the returned ``src_x_sort_idx`` so the final matrix
+    columns line up with the user's original data layout. For 2D / curvilinear
+    coords the existing uniform-shift fallback is kept.
+    """
     if x_coord not in source.coords or x_coord not in target.coords:
-        return source, target
+        return source, target, None
 
     source_x = np.asarray(source[x_coord].values)
     target_x = np.asarray(target[x_coord].values)
     if not _looks_like_longitude(source_x) and not _looks_like_longitude(target_x):
-        return source, target
+        return source, target, None
 
     source_x = _unwrap_longitude(source_x)
     target_x = _unwrap_longitude(target_x)
-    # Shift target into the same 360° window as source (CF convention: x
-    # varies along the trailing axis).
     src_finite = source_x[np.isfinite(source_x)]
     tgt_finite = target_x[np.isfinite(target_x)]
-    if src_finite.size and tgt_finite.size:
+
+    src_x_sort_idx: np.ndarray | None = None
+    if (
+        source_x.ndim == 1
+        and target_x.ndim == 1
+        and src_finite.size
+        and tgt_finite.size
+    ):
+        # Per-value wrap source into target's 360° window — mirrors format_lon
+        # so source [0, 360] vs target [-180, 180] (and either reversed)
+        # aligns. A uniform offset can't reconcile cross-convention grids:
+        # mean diff is exactly 180° and round() is banker's-rounded to 0.
+        wrap_point = float((tgt_finite[0] + tgt_finite[-1] + 360.0) / 2.0)
+        source_x = np.where(
+            source_x < wrap_point - 360.0, source_x + 360.0, source_x
+        )
+        source_x = np.where(source_x > wrap_point, source_x - 360.0, source_x)
+        diffs = np.diff(source_x)
+        if not (np.all(diffs > 0) or np.all(diffs < 0)):
+            src_x_sort_idx = np.argsort(source_x, kind="stable")
+            source_x = source_x[src_x_sort_idx]
+    elif src_finite.size and tgt_finite.size:
+        # 2D / curvilinear: fall back to uniform shift of target into source's
+        # window. Doesn't handle cross-convention but preserves the existing
+        # antimeridian-crossing behavior for 2D coords.
         target_x = target_x + _periodic_offset(
             float(src_finite.mean()), float(tgt_finite.mean())
         )
     return (
         utils.update_coord(source, x_coord, source_x),
         cast(xr.Dataset, utils.update_coord(target, x_coord, target_x)),
+        src_x_sort_idx,
     )
 
 
@@ -721,6 +765,58 @@ def _unwrap_ring(ring: np.ndarray) -> np.ndarray:
             offset += 360.0
         new_ring[i, 0] += offset
     return new_ring
+
+
+def _remap_columns_for_axis_sort(
+    areas: "sparse.COO | np.ndarray",
+    sort_idx: np.ndarray,
+    src_shape: tuple[int, ...],
+    axis_index: int,
+) -> "sparse.COO | np.ndarray":
+    """Relabel the column indices of an ``(n_dst, prod(src_shape))`` area
+    matrix so that columns appear in the user's original source-data order
+    after ``sort_idx`` was applied along ``axis_index`` of ``src_shape``.
+
+    A row-major source flat index ``c = unravel(c, src_shape)`` has its
+    ``axis_index`` component ``i_sorted`` permuted via
+    ``i_orig = sort_idx[i_sorted]``; all other components are untouched. So
+    the new flat index is ``c_new = c // stride * stride + (i_orig - i_sorted) * inner + ...``.
+    For separable 1D-rect grids (the only case that triggers this today) the
+    sorted axis sits between an outer block of size ``outer`` and an inner
+    block of size ``inner`` with ``stride = nx * inner``.
+    """
+    nx = int(src_shape[axis_index])
+    inner = int(np.prod(src_shape[axis_index + 1 :]))
+    stride = nx * inner
+    sort_idx = np.asarray(sort_idx, dtype=np.int64)
+
+    if _HAS_SPARSE and isinstance(areas, sparse.COO):
+        old_col = np.asarray(areas.coords[1], dtype=np.int64)
+        outer_block = (old_col // stride) * stride
+        within = old_col % stride
+        i_sorted = within // inner
+        rest = within % inner
+        new_col = outer_block + sort_idx[i_sorted] * inner + rest
+        coords = np.stack([np.asarray(areas.coords[0], dtype=np.int64), new_col])
+        return sparse.COO(
+            coords=coords,
+            data=np.asarray(areas.data),
+            shape=areas.shape,
+            has_duplicates=False,
+            sorted=False,
+        )
+
+    arr = np.asarray(areas)
+    n_cells = arr.shape[1]
+    inv_sort_idx = np.empty_like(sort_idx)
+    inv_sort_idx[sort_idx] = np.arange(sort_idx.size, dtype=sort_idx.dtype)
+    cells = np.arange(n_cells, dtype=np.int64)
+    outer_block = (cells // stride) * stride
+    within = cells % stride
+    i_orig = within // inner
+    rest = within % inner
+    inv_perm = outer_block + inv_sort_idx[i_orig] * inner + rest
+    return arr[:, inv_perm]
 
 
 def _transpose_weights(

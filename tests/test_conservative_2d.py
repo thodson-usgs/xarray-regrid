@@ -110,6 +110,51 @@ def test_antimeridian_rectilinear_constant():
     np.testing.assert_allclose(out.values, 2.5, atol=1e-12)
 
 
+def test_cross_convention_longitude_alignment():
+    """Source on [0, 360] with target on [-180, 180] (and vice versa) must
+    align — a uniform shift can't reconcile the two conventions, so per-value
+    wrap of source longitudes is required. Regression: previously yielded
+    NaN on half the target cells because banker's rounding on the exact-180°
+    mean diff produced a zero offset."""
+    src_vals = np.array([1.0, 2.0, 3.0, 4.0])
+    tgt_vals_neg = np.array([-135.0, -45.0, 45.0, 135.0])
+    src_vals_neg_x = np.array([45.0, 135.0, 225.0, 315.0])
+    da = xr.DataArray(
+        np.broadcast_to(src_vals, (2, 4)).copy(),
+        dims=("latitude", "longitude"),
+        coords={"latitude": [-30.0, 30.0], "longitude": src_vals_neg_x},
+    )
+    target = xr.Dataset(
+        coords={"latitude": [-30.0, 30.0], "longitude": tgt_vals_neg}
+    )
+    expected = da.regrid.conservative(target).transpose("latitude", "longitude")
+    out_planar = da.regrid.conservative_2d(
+        target, x_coord="longitude", y_coord="latitude"
+    ).transpose("latitude", "longitude")
+    out_spherical = da.regrid.conservative_2d(
+        target, x_coord="longitude", y_coord="latitude", spherical=True
+    ).transpose("latitude", "longitude")
+    np.testing.assert_allclose(out_planar.values, expected.values, atol=1e-12)
+    np.testing.assert_allclose(out_spherical.values, expected.values, atol=1e-12)
+
+    # Reverse: source on [-180, 180], target on [0, 360].
+    da_rev = xr.DataArray(
+        np.broadcast_to(src_vals, (2, 4)).copy(),
+        dims=("latitude", "longitude"),
+        coords={"latitude": [-30.0, 30.0], "longitude": tgt_vals_neg},
+    )
+    target_rev = xr.Dataset(
+        coords={"latitude": [-30.0, 30.0], "longitude": src_vals_neg_x}
+    )
+    expected_rev = da_rev.regrid.conservative(target_rev).transpose(
+        "latitude", "longitude"
+    )
+    out_rev = da_rev.regrid.conservative_2d(
+        target_rev, x_coord="longitude", y_coord="latitude"
+    ).transpose("latitude", "longitude")
+    np.testing.assert_allclose(out_rev.values, expected_rev.values, atol=1e-12)
+
+
 def test_polygon_nan_threshold_invalid():
     da = _rect_da()
     with pytest.raises(ValueError):
