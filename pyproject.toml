@@ -44,8 +44,12 @@ accel = [
   "opt-einsum",
   "dask[distributed]",
 ]
-polygon = [
+conservative-2d = [
+  # For conservative regridding on grids that aren't 1D-separable
+  # (curvilinear, unstructured). Uses shapely for 2D polygon intersection.
   "shapely>=2.0",
+  # Needed by ConservativeRegridder.to_netcdf / from_netcdf (group support).
+  "h5netcdf",
 ]
 benchmarking = [
   "matplotlib",
@@ -77,7 +81,7 @@ docs = [  # Required for ReadTheDocs
 path = "src/xarray_regrid/__init__.py"
 
 [tool.hatch.envs.default]
-features = ["accel", "dev", "benchmarking", "polygon"]
+features = ["accel", "dev", "benchmarking", "conservative-2d"]
 
 [tool.hatch.envs.default.scripts]
 lint = [
@@ -188,3 +192,14 @@ warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 exclude = ["tests/*", "docs"]
+
+# shapely and sparse are untyped; the conservative_2d module bridges to them,
+# so treating every signature that mentions sparse.COO as an error is noise.
+[[tool.mypy.overrides]]
+module = "xarray_regrid.methods.conservative_2d"
+disallow_any_unimported = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["shapely", "shapely.*", "sparse"]
+ignore_missing_imports = true

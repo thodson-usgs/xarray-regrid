@@ -6,7 +6,7 @@ import xarray as xr
 
 from xarray_regrid.methods import (
     conservative,
-    conservative_polygon,
+    conservative_2d,
     flox_reduce,
     interp,
 )
@@ -22,9 +22,11 @@ class Regridder:
         linear: linear, bilinear, or higher dimensional linear interpolation
         nearest: nearest-neighbor regridding
         cubic: cubic spline regridding
-        conservative: axis-factored conservative regridding (rectilinear only)
-        conservative_polygon: polygon-intersection conservative regridding,
-            including curvilinear grids (requires shapely)
+        conservative: axis-factored conservative regridding (rectilinear,
+            1D-separable grids only)
+        conservative_2d: conservative regridding for grids that aren't
+            1D-separable — curvilinear 2D coords, unstructured meshes, or
+            arbitrary polygon-to-polygon aggregation (requires shapely)
         most_common: most common value regridder
         stat: area statistics regridder
     """
@@ -89,28 +91,34 @@ class Regridder:
         ds_formatted = format_for_regrid(self._obj, ds_target_grid)
         return interp.interp_regrid(ds_formatted, ds_target_grid, "cubic")
 
-    def conservative_polygon(
+    def conservative_2d(
         self,
         ds_target_grid: xr.Dataset,
         x_coord: str = "longitude",
         y_coord: str = "latitude",
+        spherical: bool = False,
         time_dim: str | None = "time",
         skipna: bool = True,
         nan_threshold: float = 1.0,
         n_threads: int | None = None,
     ) -> xr.DataArray | xr.Dataset:
-        """Polygon-intersection conservative regrid (planar geometry only).
+        """Conservative regrid for grids that aren't 1D-separable.
 
-        Unlike ``.conservative``, this path handles curvilinear grids whose
-        x/y coordinates are 2D arrays. Planar only: users on global lat/lon
-        grids should expect small area errors near the poles and across the
-        antimeridian. Requires ``shapely >= 2.0``.
+        Use this when ``.conservative`` can't express your grid: curvilinear
+        coordinates (2D ``lat``/``lon`` arrays), unstructured meshes, or any
+        arbitrary polygon target. Computes 2D cell-polygon intersections via
+        shapely. Defaults to planar geometry; set ``spherical=True`` for
+        lat/lon grids in degrees to get proper spherical area weights via an
+        analytic cylindrical equal-area projection. Requires ``shapely >= 2.0``.
 
         Args:
             ds_target_grid: Dataset defining the target grid; must expose
                 ``x_coord`` and ``y_coord`` as coordinate variables.
             x_coord: Name of the x (longitude-like) coordinate variable.
             y_coord: Name of the y (latitude-like) coordinate variable.
+            spherical: If True, assume coords are longitude/latitude in
+                degrees and apply a Lambert cylindrical equal-area projection
+                before intersecting. Rectilinear (1D coord) grids only.
             time_dim: Name of the time dimension. Defaults to ``"time"``. Use
                 ``None`` to force regridding over the time dimension.
             skipna: If True, propagate NaNs into the weighted mean via a
@@ -126,21 +134,18 @@ class Regridder:
         if not 0.0 <= nan_threshold <= 1.0:
             msg = "nan_threshold must be between [0, 1]"
             raise ValueError(msg)
-
-        # Drop the time dim from the target if it slipped in, but skip the
-        # shared dim-match check: the curvilinear target's spatial dims need
-        # not share names with the source — they're matched by coord values.
-        if time_dim is not None and time_dim in ds_target_grid.coords:
-            ds_target_grid = ds_target_grid.isel({time_dim: 0}).reset_coords()
-        return conservative_polygon.polygon_conservative_regrid(
+        ds_target_grid = validate_input(
+            self._obj, ds_target_grid, time_dim, require_shared_dims=False
+        )
+        regridder = conservative_2d.ConservativeRegridder(
             self._obj,
             ds_target_grid,
             x_coord=x_coord,
             y_coord=y_coord,
-            skipna=skipna,
-            nan_threshold=nan_threshold,
+            spherical=spherical,
             n_threads=n_threads,
         )
+        return regridder.regrid(self._obj, skipna=skipna, nan_threshold=nan_threshold)
 
     def conservative(
         self,
@@ -335,6 +340,7 @@ def validate_input(
     data: xr.Dataset,
     ds_target_grid: xr.Dataset,
     time_dim: str | None,
+    require_shared_dims: bool = ...,
 ) -> xr.Dataset: ...
 
 
@@ -343,6 +349,7 @@ def validate_input(
     data: xr.DataArray,
     ds_target_grid: xr.Dataset,
     time_dim: str | None,
+    require_shared_dims: bool = ...,
 ) -> xr.Dataset: ...
 
 
@@ -350,11 +357,14 @@ def validate_input(
     data: xr.DataArray | xr.Dataset,
     ds_target_grid: xr.Dataset,
     time_dim: str | None,
+    require_shared_dims: bool = True,
 ) -> xr.Dataset:
     if time_dim is not None and time_dim in ds_target_grid.coords:
         ds_target_grid = ds_target_grid.isel({time_dim: 0}).reset_coords()
 
-    if len(set(data.dims).intersection(set(ds_target_grid.dims))) == 0:
+    # Curvilinear regridders match source and target by coord values, not by
+    # dim name, so they opt out of the shared-dim requirement.
+    if require_shared_dims and not set(data.dims) & set(ds_target_grid.dims):
         msg = (
             "None of the target dims are in the data:\n"
             " regridding is not possible.\n"
@@ -363,7 +373,7 @@ def validate_input(
         )
         raise ValueError(msg)
 
-    if len(set(data.coords).intersection(set(ds_target_grid.coords))) == 0:
+    if not set(data.coords) & set(ds_target_grid.coords):
         msg = (
             "None of the target coords are in the data:\n"
             " regridding is not possible.\n"

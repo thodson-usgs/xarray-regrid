@@ -7,7 +7,7 @@ import numpy as np
 import xarray as xr
 
 try:
-    import sparse  # type: ignore
+    import sparse
 except ImportError:
     sparse = None
 
