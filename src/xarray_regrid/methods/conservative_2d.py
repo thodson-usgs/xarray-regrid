@@ -22,9 +22,7 @@ import warnings
 from collections.abc import Hashable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from functools import cached_property
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -32,20 +30,16 @@ import numpy as np
 import xarray as xr
 
 from xarray_regrid import utils
+from xarray_regrid.methods._conservative_2d_serialization import (
+    _coo_components,
+    _coo_from_components,
+    _metadata_attrs,
+    _metadata_from_attrs,
+)
+from xarray_regrid.methods._conservative_2d_spec import RegridSpec
 from xarray_regrid.methods.conservative import get_valid_threshold
 
 NetcdfEngine = Literal["netcdf4", "scipy", "h5netcdf"] | None
-
-
-def _package_version() -> str:
-    try:
-        return version("xarray-regrid")
-    except PackageNotFoundError:
-        return "unknown"
-
-
-# Bump on breaking change to the on-disk format in ConservativeRegridder.to_netcdf.
-_SCHEMA_VERSION = 1
 
 
 try:
@@ -192,6 +186,19 @@ class ConservativeRegridder:
         self._source_coords = source.coords.to_dataset()
         self._target_coords = target.coords.to_dataset()
 
+    @property
+    def spec(self) -> RegridSpec:
+        """Canonical metadata describing this regridder's layout."""
+        return RegridSpec(
+            src_dims=self._src_dims,
+            dst_dims=self._dst_dims,
+            src_shape=self._src_shape,
+            dst_shape=self._dst_shape,
+            x_coord=self.x_coord,
+            y_coord=self.y_coord,
+            spherical=self.spherical,
+        )
+
     @cached_property
     def _forward(self) -> _Direction:
         return _Direction(self.areas)
@@ -210,6 +217,16 @@ class ConservativeRegridder:
         """The row-normalized backward weight matrix (target → source)."""
         return self._backward.weights
 
+    @property
+    def target_areas(self) -> np.ndarray:
+        """Area of each target cell overlapped by the source domain."""
+        return _sum_matrix_axis_1d(self.areas, axis=1)
+
+    @property
+    def source_coverage_areas(self) -> np.ndarray:
+        """Area of each source cell covered by target cells."""
+        return _sum_matrix_axis_1d(self.areas, axis=0)
+
     def regrid(
         self,
         data: xr.DataArray | xr.Dataset,
@@ -220,13 +237,8 @@ class ConservativeRegridder:
         return _apply_stored_weights(
             data,
             direction=self._forward,
-            src_dims=self._src_dims,
-            dst_dims=self._dst_dims,
-            src_shape=self._src_shape,
-            dst_shape=self._dst_shape,
+            spec=self.spec,
             target_coords=self._target_coords,
-            x_coord=self.x_coord,
-            y_coord=self.y_coord,
             skipna=skipna,
             nan_threshold=nan_threshold,
         )
@@ -247,13 +259,15 @@ class ConservativeRegridder:
             areas=_transpose_weights(self.areas),
             source_coords=self._target_coords,
             target_coords=self._source_coords,
-            src_dims=self._dst_dims,
-            dst_dims=self._src_dims,
-            src_shape=self._dst_shape,
-            dst_shape=self._src_shape,
-            x_coord=self.x_coord,
-            y_coord=self.y_coord,
-            spherical=self.spherical,
+            spec=RegridSpec(
+                src_dims=self._dst_dims,
+                dst_dims=self._src_dims,
+                src_shape=self._dst_shape,
+                dst_shape=self._src_shape,
+                x_coord=self.x_coord,
+                y_coord=self.y_coord,
+                spherical=self.spherical,
+            ),
         )
         if "_forward" in self.__dict__:
             new.__dict__["_backward"] = self.__dict__["_forward"]
@@ -288,7 +302,7 @@ class ConservativeRegridder:
                 "_coo_data": (("nnz",), data),
             },
             attrs={
-                **_metadata_attrs(self),
+                **_metadata_attrs(self.spec, self._source_coords, self._target_coords),
                 "n_dst": int(shape[0]),
                 "n_src": int(shape[1]),
             },
@@ -329,7 +343,7 @@ class ConservativeRegridder:
             areas=_coo_from_components(row, col, data, (n_dst, n_src)),
             source_coords=source_coords,
             target_coords=target_coords,
-            **meta,
+            spec=meta,
         )
 
     @classmethod
@@ -339,25 +353,19 @@ class ConservativeRegridder:
         areas: "sparse.COO | np.ndarray",
         source_coords: xr.Dataset,
         target_coords: xr.Dataset,
-        src_dims: tuple[Hashable, ...],
-        dst_dims: tuple[Hashable, ...],
-        src_shape: tuple[int, ...],
-        dst_shape: tuple[int, ...],
-        x_coord: str,
-        y_coord: str,
-        spherical: bool,
+        spec: RegridSpec,
     ) -> "ConservativeRegridder":
         """Construct a regridder directly from its canonical state. Shared
         bypass of ``__init__`` used by :meth:`from_netcdf` and
         :meth:`from_polygons`; keeps the list of private attrs in one place."""
         instance = object.__new__(cls)
-        instance.x_coord = x_coord
-        instance.y_coord = y_coord
-        instance.spherical = spherical
-        instance._src_dims = src_dims
-        instance._dst_dims = dst_dims
-        instance._src_shape = src_shape
-        instance._dst_shape = dst_shape
+        instance.x_coord = spec.x_coord
+        instance.y_coord = spec.y_coord
+        instance.spherical = spec.spherical
+        instance._src_dims = spec.src_dims
+        instance._dst_dims = spec.dst_dims
+        instance._src_shape = spec.src_shape
+        instance._dst_shape = spec.dst_shape
         instance.areas = areas
         instance._source_coords = source_coords
         instance._target_coords = target_coords
@@ -434,13 +442,15 @@ class ConservativeRegridder:
             ),
             source_coords=xr.Dataset(coords={source_dim: np.arange(n_src)}),
             target_coords=tgt_ds,
-            src_dims=(source_dim,),
-            dst_dims=(target_dim,),
-            src_shape=(n_src,),
-            dst_shape=(n_dst,),
-            x_coord="",
-            y_coord="",
-            spherical=False,
+            spec=RegridSpec(
+                src_dims=(source_dim,),
+                dst_dims=(target_dim,),
+                src_shape=(n_src,),
+                dst_shape=(n_dst,),
+                x_coord="",
+                y_coord="",
+                spherical=False,
+            ),
         )
 
 
@@ -471,13 +481,8 @@ def polygons_from_coords(
 def _apply_stored_weights(
     data: xr.DataArray | xr.Dataset,
     direction: _Direction,
-    src_dims: tuple[Hashable, ...],
-    dst_dims: tuple[Hashable, ...],
-    src_shape: tuple[int, ...],
-    dst_shape: tuple[int, ...],
+    spec: RegridSpec,
     target_coords: xr.Dataset,
-    x_coord: str,
-    y_coord: str,
     skipna: bool,
     nan_threshold: float,
 ) -> xr.DataArray | xr.Dataset:
@@ -487,16 +492,18 @@ def _apply_stored_weights(
     The apply matrix has shape ``(n_src, n_dst)`` so the matmul is
     ``(..., n_src) @ (n_src, n_dst) → (..., n_dst)`` with no per-call transpose.
     """
-    actual_src_shape = tuple(int(data.sizes[d]) for d in src_dims if d in data.sizes)
-    if actual_src_shape != src_shape:
+    actual_src_shape = tuple(
+        int(data.sizes[d]) for d in spec.src_dims if d in data.sizes
+    )
+    if actual_src_shape != spec.src_shape:
         msg = (
-            f"source spatial shape {actual_src_shape} on dims {src_dims} does "
-            f"not match the regridder's expected shape {src_shape}"
+            f"source spatial shape {actual_src_shape} on dims {spec.src_dims} does "
+            f"not match the regridder's expected shape {spec.src_shape}"
         )
         raise ValueError(msg)
 
-    src_tokens = tuple(f"__src_{d}" for d in src_dims)
-    data_renamed = data.rename(dict(zip(src_dims, src_tokens, strict=True)))
+    src_tokens = tuple(f"__src_{d}" for d in spec.src_dims)
+    data_renamed = data.rename(dict(zip(spec.src_dims, src_tokens, strict=True)))
 
     output_dtype = _result_dtype(data)
     result = xr.apply_ufunc(
@@ -506,25 +513,31 @@ def _apply_stored_weights(
             "apply_weights": direction.apply_matrix,
             "coverage": direction.coverage,
             "coverage_all": direction.coverage_all,
-            "src_shape": src_shape,
-            "dst_shape": dst_shape,
+            "src_shape": spec.src_shape,
+            "dst_shape": spec.dst_shape,
             "skipna": skipna,
             "nan_threshold": nan_threshold,
             "output_dtype": output_dtype,
         },
         input_core_dims=[list(src_tokens)],
-        output_core_dims=[list(dst_dims)],
+        output_core_dims=[list(spec.dst_dims)],
         exclude_dims=set(src_tokens),
         dask="parallelized",
         output_dtypes=[output_dtype],
         dask_gufunc_kwargs={
-            "output_sizes": {d: int(target_coords.sizes[d]) for d in dst_dims},
+            "output_sizes": {d: int(target_coords.sizes[d]) for d in spec.dst_dims},
             "allow_rechunk": True,
         },
         keep_attrs=True,
     )
 
-    return _assign_target_coords(result, target_coords, dst_dims, x_coord, y_coord)
+    return _assign_target_coords(
+        result,
+        target_coords,
+        spec.dst_dims,
+        spec.x_coord,
+        spec.y_coord,
+    )
 
 
 def _coverage_mask(areas: "sparse.COO | np.ndarray") -> np.ndarray:
@@ -540,91 +553,11 @@ def _coverage_mask(areas: "sparse.COO | np.ndarray") -> np.ndarray:
     return np.asarray((arr > 0).any(axis=1))
 
 
-def _coo_components(
-    w: "sparse.COO | np.ndarray",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
-    if _HAS_SPARSE and isinstance(w, sparse.COO):
-        coords = np.asarray(w.coords)
-        return (
-            coords[0].astype(np.int64, copy=False),
-            coords[1].astype(np.int64, copy=False),
-            np.asarray(w.data),
-            w.shape,
-        )
-    arr = np.asarray(w)
-    rows, cols = np.nonzero(arr)
-    return (
-        rows.astype(np.int64, copy=False),
-        cols.astype(np.int64, copy=False),
-        arr[rows, cols],
-        arr.shape,
-    )
-
-
-def _coo_from_components(
-    row: np.ndarray,
-    col: np.ndarray,
-    data: np.ndarray,
-    shape: tuple[int, int],
-) -> "sparse.COO | np.ndarray":
-    if _HAS_SPARSE:
-        return sparse.COO(
-            coords=np.stack([row, col]),
-            data=data,
-            shape=shape,
-            has_duplicates=False,
-            sorted=False,
-        )
-    dense = np.zeros(shape, dtype=data.dtype if data.size else np.float64)
-    dense[row, col] = data
-    return dense
-
-
-def _metadata_attrs(regridder: ConservativeRegridder) -> dict[str, Any]:
-    attrs: dict[str, Any] = {
-        "x_coord": regridder.x_coord,
-        "y_coord": regridder.y_coord,
-        "spherical": int(regridder.spherical),
-        "src_dims": [str(d) for d in regridder._src_dims],
-        "dst_dims": [str(d) for d in regridder._dst_dims],
-        "src_shape": list(regridder._src_shape),
-        "dst_shape": list(regridder._dst_shape),
-        "xarray_regrid_version": _package_version(),
-        "created": datetime.now(tz=timezone.utc).isoformat(),
-        "schema_version": _SCHEMA_VERSION,
-    }
-    for prefix, ds, coord in [
-        ("source_x", regridder._source_coords, regridder.x_coord),
-        ("source_y", regridder._source_coords, regridder.y_coord),
-        ("target_x", regridder._target_coords, regridder.x_coord),
-        ("target_y", regridder._target_coords, regridder.y_coord),
-    ]:
-        if coord and coord in ds.coords and ds[coord].size:
-            attrs[f"{prefix}_range"] = [float(ds[coord].min()), float(ds[coord].max())]
-    return attrs
-
-
-def _metadata_from_attrs(attrs: dict[str, Any], path: Path) -> dict[str, Any]:
-    """Parse the kwargs needed by :meth:`ConservativeRegridder._from_state` out
-    of netCDF root attributes, validating ``schema_version``."""
-    schema_version = int(attrs.get("schema_version", 0))
-    if schema_version != _SCHEMA_VERSION:
-        msg = (
-            f"regridder file at {path} uses schema version {schema_version}; "
-            f"this xarray-regrid understands {_SCHEMA_VERSION}. "
-            "Upgrade xarray-regrid or re-save."
-        )
-        raise ValueError(msg)
-
-    return {
-        "x_coord": str(attrs["x_coord"]),
-        "y_coord": str(attrs["y_coord"]),
-        "spherical": bool(int(attrs["spherical"])),
-        "src_dims": tuple(str(d) for d in np.atleast_1d(attrs["src_dims"])),
-        "dst_dims": tuple(str(d) for d in np.atleast_1d(attrs["dst_dims"])),
-        "src_shape": tuple(int(s) for s in np.atleast_1d(attrs["src_shape"])),
-        "dst_shape": tuple(int(s) for s in np.atleast_1d(attrs["dst_shape"])),
-    }
+def _sum_matrix_axis_1d(areas: "sparse.COO | np.ndarray", axis: int) -> np.ndarray:
+    summed = areas.sum(axis=axis)
+    if hasattr(summed, "todense"):
+        summed = summed.todense()
+    return np.asarray(summed, dtype=np.float64).reshape(-1)
 
 
 def _normalize_longitude_coords(
@@ -784,7 +717,8 @@ def _remap_columns_for_axis_sort(
     A row-major source flat index ``c = unravel(c, src_shape)`` has its
     ``axis_index`` component ``i_sorted`` permuted via
     ``i_orig = sort_idx[i_sorted]``; all other components are untouched. So
-    the new flat index is ``c_new = c // stride * stride + (i_orig - i_sorted) * inner + ...``.
+    the new flat index is
+    ``c_new = c // stride * stride + (i_orig - i_sorted) * inner + ...``.
     For separable 1D-rect grids (the only case that triggers this today) the
     sorted axis sits between an outer block of size ``outer`` and an inner
     block of size ``inner`` with ``stride = nx * inner``.

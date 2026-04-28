@@ -181,7 +181,7 @@ class Regridder:
             Data regridded to the target dataset coordinates.
         """
         if not 0.0 <= nan_threshold <= 1.0:
-            msg = "nan_threshold must be between [0, 1]]"
+            msg = "nan_threshold must be between [0, 1]"
             raise ValueError(msg)
 
         ds_target_grid = validate_input(self._obj, ds_target_grid, time_dim)

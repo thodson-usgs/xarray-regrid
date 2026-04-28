@@ -432,12 +432,11 @@ def test_from_polygons_mass_conservation():
     s = rng.normal(size=src_polys.size)
     da = xr.DataArray(s, dims=("face",))
     out = rgr.regrid(da).values
-    # Direct mass = sum_i s_i * (sum_j A_ij). Matches output if we multiply
-    # output by target-covered area = sum_i A_ij.
-    areas = rgr.areas  # (n_tgt, n_src)
-    tgt_covered = areas.sum(axis=1).todense()
+    # Direct mass = sum_i s_i * source_coverage_i. Matches output if we
+    # multiply output by target-covered area.
+    tgt_covered = rgr.target_areas
     valid = tgt_covered > 0
-    direct = float((s * areas.sum(axis=0).todense()).sum())
+    direct = float((s * rgr.source_coverage_areas).sum())
     via_regrid = float((out[valid] * tgt_covered[valid]).sum())
     rel = abs(direct - via_regrid) / max(abs(direct), 1e-12)
     assert rel < 1e-12, f"rel err {rel:.2e}"

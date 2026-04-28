@@ -80,7 +80,7 @@ def create_lat_lon_coords(grid: Grid) -> tuple[np.ndarray, np.ndarray]:
             grid.south, grid.north + grid.resolution_lat, grid.resolution_lat
         )
 
-    if np.remainder((grid.east - grid.west), grid.resolution_lat) > 0:
+    if np.remainder((grid.east - grid.west), grid.resolution_lon) > 0:
         lon_coords = np.arange(grid.west, grid.east, grid.resolution_lon)
     else:
         lon_coords = np.arange(
