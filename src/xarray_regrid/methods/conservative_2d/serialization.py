@@ -6,15 +6,8 @@ from typing import Any, Literal
 import numpy as np
 import xarray as xr
 
+from xarray_regrid.methods.conservative_2d._deps import HAS_SPARSE, sparse
 from xarray_regrid.methods.conservative_2d.spec import RegridSpec
-
-try:
-    import sparse
-
-    _HAS_SPARSE = True
-except ImportError:  # pragma: no cover
-    sparse = None
-    _HAS_SPARSE = False
 
 # Bump on breaking change to the on-disk format in ConservativeRegridder.to_netcdf.
 _SCHEMA_VERSION = 1
@@ -31,7 +24,7 @@ def _package_version() -> str:
 def _coo_components(
     weights: "sparse.COO | np.ndarray",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
-    if _HAS_SPARSE and isinstance(weights, sparse.COO):
+    if HAS_SPARSE and isinstance(weights, sparse.COO):
         coords = np.asarray(weights.coords)
         return (
             coords[0].astype(np.int64, copy=False),
@@ -55,7 +48,7 @@ def _coo_from_components(
     data: np.ndarray,
     shape: tuple[int, int],
 ) -> "sparse.COO | np.ndarray":
-    if _HAS_SPARSE:
+    if HAS_SPARSE:
         return sparse.COO(
             coords=np.stack([row, col]),
             data=data,

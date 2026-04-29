@@ -30,6 +30,7 @@ from xarray_regrid.methods.conservative_2d.serialization import (
     load_regridder_netcdf,
     save_regridder_netcdf,
 )
+from xarray_regrid.methods.conservative_2d._deps import require_shapely
 from xarray_regrid.methods.conservative_2d.apply import (
     apply_stored_weights as _apply_stored_weights,
 )
@@ -48,12 +49,6 @@ warnings.filterwarnings(
     message="Nan will not be propagated in matrix multiplication",
     category=RuntimeWarning,
 )
-
-
-def _check_shapely() -> None:
-    _geom.check_shapely()
-
-
 class _Direction:
     """Lazy weights, apply matrix, and coverage mask for one regrid direction.
 
@@ -116,7 +111,7 @@ class ConservativeRegridder:
         spherical: bool = False,
         n_threads: int | None = None,
     ) -> None:
-        _check_shapely()
+        require_shapely()
         source_grid, target_grid, src_x_sort_idx = _geom.normalize_longitude_coords(
             source, target, x_coord
         )
@@ -349,7 +344,7 @@ class ConservativeRegridder:
         cells, project into an equal-area CRS first or use the structured
         path with ``spherical=True``.
         """
-        _check_shapely()
+        require_shapely()
         src_polys = np.asarray(source_polygons)
         dst_polys = np.asarray(target_polygons)
         if src_polys.ndim != 1 or dst_polys.ndim != 1:
@@ -412,7 +407,7 @@ def polygons_from_coords(
     via :meth:`ConservativeRegridder.from_polygons`. ``spherical=True``
     projects 1D lat/lon (degrees) into Lambert cylindrical equal-area space;
     ``periodic=True`` unwraps antimeridian-crossing cells."""
-    _check_shapely()
+    require_shapely()
     x = np.asarray(x)
     y = np.asarray(y)
     if periodic:

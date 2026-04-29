@@ -4,37 +4,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-
-try:
-    import shapely
-    from shapely.strtree import STRtree
-
-    _HAS_SHAPELY = True
-except ImportError:  # pragma: no cover
-    shapely = None
-    STRtree = None
-    _HAS_SHAPELY = False
-
-try:
-    import sparse
-
-    _HAS_SPARSE = True
-except ImportError:  # pragma: no cover
-    sparse = None
-    _HAS_SPARSE = False
-
-
-def _check_shapely() -> None:
-    if not _HAS_SHAPELY:
-        msg = (
-            "polygon conservative regridding requires shapely >= 2.0; "
-            "install with `pip install shapely`."
-        )
-        raise ImportError(msg)
+from xarray_regrid.methods.conservative_2d._deps import (
+    HAS_SPARSE,
+    STRtree,
+    require_shapely,
+    shapely,
+    sparse,
+)
 
 
 def coverage_mask(areas: "sparse.COO | np.ndarray") -> np.ndarray:
-    if _HAS_SPARSE and isinstance(areas, sparse.COO):
+    if HAS_SPARSE and isinstance(areas, sparse.COO):
         n_dst = int(areas.shape[0])
         mask = np.zeros(n_dst, dtype=bool)
         mask[areas.coords[0]] = True
@@ -53,7 +33,7 @@ def sum_matrix_axis_1d(areas: "sparse.COO | np.ndarray", axis: int) -> np.ndarra
 def transpose_weights(
     w: "sparse.COO | np.ndarray", *, sort: bool = False
 ) -> "sparse.COO | np.ndarray":
-    if _HAS_SPARSE and isinstance(w, sparse.COO):
+    if HAS_SPARSE and isinstance(w, sparse.COO):
         t = w.T
         out = sparse.COO(
             coords=np.asarray(t.coords),
@@ -69,7 +49,7 @@ def transpose_weights(
 
 
 def row_normalize(areas: "sparse.COO | np.ndarray") -> "sparse.COO | np.ndarray":
-    if _HAS_SPARSE and isinstance(areas, sparse.COO):
+    if HAS_SPARSE and isinstance(areas, sparse.COO):
         n_dst = areas.shape[0]
         dst_idx = areas.coords[0]
         src_idx = areas.coords[1]
@@ -91,7 +71,7 @@ def row_normalize(areas: "sparse.COO | np.ndarray") -> "sparse.COO | np.ndarray"
 
 
 def empty_weights(n_dst: int, n_src: int) -> "sparse.COO | np.ndarray":
-    if _HAS_SPARSE:
+    if HAS_SPARSE:
         return sparse.COO(
             coords=np.zeros((2, 0), dtype=np.int64),
             data=np.zeros(0, dtype=np.float64),
@@ -103,7 +83,7 @@ def empty_weights(n_dst: int, n_src: int) -> "sparse.COO | np.ndarray":
 def intersection_areas_threaded(
     a: np.ndarray, b: np.ndarray, n_threads: int | None
 ) -> np.ndarray:
-    _check_shapely()
+    require_shapely()
     n = len(a)
     if n_threads is None:
         n_threads = 1 if n < 1_000 else min(os.cpu_count() or 1, 16)
@@ -127,7 +107,7 @@ def build_intersection_areas(
     *,
     predicate_filter: bool = False,
 ) -> "sparse.COO | np.ndarray":
-    _check_shapely()
+    require_shapely()
     n_dst = len(dst.polys)
     n_src = len(src.polys)
 
@@ -159,7 +139,7 @@ def build_intersection_areas(
     if dst_idx.size == 0:
         return empty_weights(n_dst, n_src)
 
-    if _HAS_SPARSE:
+    if HAS_SPARSE:
         return sparse.COO(
             coords=np.stack([dst_idx, src_idx]),
             data=areas.astype(np.float64),

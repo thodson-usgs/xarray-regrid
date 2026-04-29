@@ -6,33 +6,17 @@ import numpy as np
 import xarray as xr
 
 from xarray_regrid import utils
-
-try:
-    import shapely
-    from shapely import affinity
-
-    _HAS_SHAPELY = True
-except ImportError:  # pragma: no cover
-    shapely = None
-    affinity = None
-    _HAS_SHAPELY = False
-
-try:
-    import sparse
-
-    _HAS_SPARSE = True
-except ImportError:  # pragma: no cover
-    sparse = None
-    _HAS_SPARSE = False
+from xarray_regrid.methods.conservative_2d._deps import (
+    HAS_SPARSE,
+    affinity,
+    require_shapely,
+    shapely,
+    sparse,
+)
 
 
 def check_shapely() -> None:
-    if not _HAS_SHAPELY:
-        msg = (
-            "polygon conservative regridding requires shapely >= 2.0; "
-            "install with `pip install shapely`."
-        )
-        raise ImportError(msg)
+    require_shapely()
 
 
 @dataclass
@@ -226,7 +210,7 @@ def remap_columns_for_axis_sort(
     stride = nx * inner
     sort_idx = np.asarray(sort_idx, dtype=np.int64)
 
-    if _HAS_SPARSE and isinstance(areas, sparse.COO):
+    if HAS_SPARSE and isinstance(areas, sparse.COO):
         old_col = np.asarray(areas.coords[1], dtype=np.int64)
         outer_block = (old_col // stride) * stride
         within = old_col % stride
