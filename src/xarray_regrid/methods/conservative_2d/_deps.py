@@ -1,6 +1,4 @@
-from typing import TYPE_CHECKING
-
-import numpy as np
+from typing import Any, TypeAlias
 
 SHAPELY_IMPORT_ERROR = (
     "polygon conservative regridding requires shapely >= 2.0; "
@@ -27,12 +25,7 @@ except ImportError:  # pragma: no cover
     sparse = None
     HAS_SPARSE = False
 
-if TYPE_CHECKING:
-    import sparse as sparse_mod
-
-    AreaMatrix = sparse_mod.COO | np.ndarray
-else:
-    AreaMatrix = np.ndarray
+AreaMatrix: TypeAlias = Any
 
 
 def require_shapely() -> None:

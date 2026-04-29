@@ -4,8 +4,8 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
-from xarray_regrid.methods.conservative_2d.spec import RegridSpec
 from xarray_regrid.methods.conservative import get_valid_threshold
+from xarray_regrid.methods.conservative_2d.spec import RegridSpec
 
 
 def apply_stored_weights(

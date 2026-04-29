@@ -6,7 +6,7 @@ from typing import Any, Literal
 import numpy as np
 import xarray as xr
 
-from xarray_regrid.methods.conservative_2d._deps import HAS_SPARSE, sparse
+from xarray_regrid.methods.conservative_2d._deps import HAS_SPARSE, AreaMatrix, sparse
 from xarray_regrid.methods.conservative_2d.spec import RegridSpec
 
 # Bump on breaking change to the on-disk format in ConservativeRegridder.to_netcdf.
@@ -21,9 +21,9 @@ def _package_version() -> str:
         return "unknown"
 
 
-def _coo_components(
-    weights: "sparse.COO | np.ndarray",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
+def _coo_components(weights: AreaMatrix) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, tuple[int, int]
+]:
     if HAS_SPARSE and isinstance(weights, sparse.COO):
         coords = np.asarray(weights.coords)
         return (
@@ -47,7 +47,7 @@ def _coo_from_components(
     col: np.ndarray,
     data: np.ndarray,
     shape: tuple[int, int],
-) -> "sparse.COO | np.ndarray":
+) -> AreaMatrix:
     if HAS_SPARSE:
         return sparse.COO(
             coords=np.stack([row, col]),
@@ -111,7 +111,7 @@ def _metadata_from_attrs(attrs: dict[str, Any], path: Path) -> RegridSpec:
 
 def save_regridder_netcdf(
     path: str | Path,
-    areas: "sparse.COO | np.ndarray",
+    areas: AreaMatrix,
     spec: RegridSpec,
     source_coords: xr.Dataset,
     target_coords: xr.Dataset,
@@ -139,7 +139,7 @@ def save_regridder_netcdf(
 def load_regridder_netcdf(
     path: str | Path,
     engine: NetcdfEngine = None,
-) -> tuple["sparse.COO | np.ndarray", xr.Dataset, xr.Dataset, RegridSpec]:
+) -> tuple[AreaMatrix, xr.Dataset, xr.Dataset, RegridSpec]:
     path = Path(path)
     with xr.open_dataset(path, engine=engine) as ds_weights:
         attrs = dict(ds_weights.attrs)

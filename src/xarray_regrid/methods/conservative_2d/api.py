@@ -18,7 +18,6 @@ stored as ``sparse.COO``; otherwise a dense numpy matrix is used.
 """
 
 import warnings
-from collections.abc import Hashable
 from functools import cached_property
 from pathlib import Path
 from typing import Literal
@@ -26,16 +25,16 @@ from typing import Literal
 import numpy as np
 import xarray as xr
 
+from xarray_regrid.methods.conservative_2d import geometry as _geom
+from xarray_regrid.methods.conservative_2d import weights as _weights
+from xarray_regrid.methods.conservative_2d._deps import AreaMatrix, require_shapely
+from xarray_regrid.methods.conservative_2d.apply import (
+    apply_stored_weights as _apply_stored_weights,
+)
 from xarray_regrid.methods.conservative_2d.serialization import (
     load_regridder_netcdf,
     save_regridder_netcdf,
 )
-from xarray_regrid.methods.conservative_2d._deps import require_shapely
-from xarray_regrid.methods.conservative_2d.apply import (
-    apply_stored_weights as _apply_stored_weights,
-)
-from xarray_regrid.methods.conservative_2d import geometry as _geom
-from xarray_regrid.methods.conservative_2d import weights as _weights
 from xarray_regrid.methods.conservative_2d.spec import RegridSpec
 
 NetcdfEngine = Literal["netcdf4", "scipy", "h5netcdf"] | None
@@ -65,15 +64,15 @@ class _Direction:
     regridder swaps them with no recomputation.
     """
 
-    def __init__(self, areas: "sparse.COO | np.ndarray") -> None:
+    def __init__(self, areas: AreaMatrix) -> None:
         self.matrix = _weights.WeightMatrix(areas)
 
     @cached_property
-    def weights(self) -> "sparse.COO | np.ndarray":
+    def weights(self) -> AreaMatrix:
         return self.matrix.row_normalized()
 
     @cached_property
-    def apply_matrix(self) -> "sparse.COO | np.ndarray":
+    def apply_matrix(self) -> AreaMatrix:
         return _weights.transpose_weights(self.weights, sort=True)
 
     @cached_property
@@ -137,7 +136,11 @@ class ConservativeRegridder:
         self._dst_dims = dst_dims
         self._src_shape = tuple(int(source.sizes[d]) for d in src_dims)
         self._dst_shape = tuple(int(target.sizes[d]) for d in dst_dims)
-        areas = _weights.build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
+        areas = _weights.build_intersection_areas(
+            src_grid,
+            dst_grid,
+            n_threads=n_threads,
+        )
         if src_x_sort_idx is not None:
             # Source x was sorted by _normalize_longitude_coords so polygon
             # construction stayed monotone. Relabel matrix columns so column
@@ -172,12 +175,12 @@ class ConservativeRegridder:
         return _Direction(_weights.WeightMatrix(self.areas).transposed())
 
     @property
-    def forward_weights(self) -> "sparse.COO | np.ndarray":
+    def forward_weights(self) -> AreaMatrix:
         """The row-normalized forward weight matrix (source → target)."""
         return self._forward.weights
 
     @property
-    def backward_weights(self) -> "sparse.COO | np.ndarray":
+    def backward_weights(self) -> AreaMatrix:
         """The row-normalized backward weight matrix (target → source)."""
         return self._backward.weights
 
@@ -290,7 +293,7 @@ class ConservativeRegridder:
     def _from_state(
         cls,
         *,
-        areas: "sparse.COO | np.ndarray",
+        areas: AreaMatrix,
         source_coords: xr.Dataset,
         target_coords: xr.Dataset,
         spec: RegridSpec,

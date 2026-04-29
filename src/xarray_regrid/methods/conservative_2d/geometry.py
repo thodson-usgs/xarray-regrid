@@ -33,7 +33,7 @@ def looks_like_longitude(values: np.ndarray) -> bool:
 
 def unwrap_longitude(values: np.ndarray) -> np.ndarray:
     radians = np.deg2rad(np.asarray(values, dtype=float))
-    return np.rad2deg(np.unwrap(radians, axis=-1))
+    return np.asarray(np.rad2deg(np.unwrap(radians, axis=-1)))
 
 
 def periodic_offset(reference: float, value: float) -> float:
@@ -97,7 +97,7 @@ def unwrap_ring(ring: np.ndarray) -> np.ndarray:
         elif step < -180.0:
             offset += 360.0
         new_ring[i, 0] += offset
-    return new_ring
+    return np.asarray(new_ring)
 
 
 def spatial_dims(
@@ -258,7 +258,12 @@ def normalize_longitude_coords(
     tgt_finite = target_x[np.isfinite(target_x)]
 
     src_x_sort_idx: np.ndarray | None = None
-    if source_x.ndim == 1 and target_x.ndim == 1 and src_finite.size and tgt_finite.size:
+    if (
+        source_x.ndim == 1
+        and target_x.ndim == 1
+        and src_finite.size
+        and tgt_finite.size
+    ):
         wrap_point = float((tgt_finite[0] + tgt_finite[-1] + 360.0) / 2.0)
         source_x = np.where(source_x < wrap_point - 360.0, source_x + 360.0, source_x)
         source_x = np.where(source_x > wrap_point, source_x - 360.0, source_x)
@@ -267,7 +272,10 @@ def normalize_longitude_coords(
             src_x_sort_idx = np.argsort(source_x, kind="stable")
             source_x = source_x[src_x_sort_idx]
     elif src_finite.size and tgt_finite.size:
-        target_x = target_x + periodic_offset(float(src_finite.mean()), float(tgt_finite.mean()))
+        target_x = target_x + periodic_offset(
+            float(src_finite.mean()),
+            float(tgt_finite.mean()),
+        )
 
     return (
         utils.update_coord(source, x_coord, source_x),
