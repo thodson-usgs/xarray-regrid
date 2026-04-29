@@ -1,6 +1,5 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -83,7 +82,6 @@ def empty_weights(n_dst: int, n_src: int) -> AreaMatrix:
 def intersection_areas_threaded(
     a: np.ndarray, b: np.ndarray, n_threads: int | None
 ) -> np.ndarray:
-    require_shapely()
     n = len(a)
     if n_threads is None:
         n_threads = 1 if n < 1_000 else min(os.cpu_count() or 1, 16)
@@ -154,20 +152,3 @@ def build_intersection_areas(
     a_dense = np.zeros((n_dst, n_src), dtype=np.float64)
     a_dense[dst_idx, src_idx] = areas
     return a_dense
-
-
-@dataclass(frozen=True)
-class WeightMatrix:
-    values: AreaMatrix
-
-    def transposed(self, *, sort: bool = False) -> AreaMatrix:
-        return transpose_weights(self.values, sort=sort)
-
-    def row_normalized(self) -> AreaMatrix:
-        return row_normalize(self.values)
-
-    def coverage(self) -> np.ndarray:
-        return coverage_mask(self.values)
-
-    def sum_axis(self, axis: int) -> np.ndarray:
-        return sum_matrix_axis_1d(self.values, axis=axis)

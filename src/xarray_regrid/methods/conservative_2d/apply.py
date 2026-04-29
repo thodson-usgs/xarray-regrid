@@ -17,11 +17,7 @@ def apply_stored_weights(
     nan_threshold: float,
 ) -> xr.DataArray | xr.Dataset:
     """Apply ``direction``'s cached, pre-transposed weight matrix to ``data``
-    via ``xr.apply_ufunc``.
-
-    The apply matrix has shape ``(n_src, n_dst)`` so the matmul is
-    ``(..., n_src) @ (n_src, n_dst) -> (..., n_dst)`` with no per-call transpose.
-    """
+    via ``xr.apply_ufunc``."""
     actual_src_shape = tuple(
         int(data.sizes[d]) for d in spec.src_dims if d in data.sizes
     )
@@ -87,13 +83,13 @@ def apply_core(
     n_src = int(np.prod(src_shape))
     flat = arr.reshape(-1, n_src) if leading_shape else arr.reshape(1, n_src)
 
-    if skipna and np.issubdtype(flat.dtype, np.floating):
-        nan_mask = np.isnan(flat)
-        has_nan = nan_mask.any()
-    else:
-        has_nan = False
+    nan_mask = (
+        np.isnan(flat)
+        if skipna and np.issubdtype(flat.dtype, np.floating)
+        else None
+    )
 
-    if has_nan:
+    if nan_mask is not None and nan_mask.any():
         mask = (~nan_mask).astype(flat.dtype)
         filled = np.where(nan_mask, flat.dtype.type(0.0), flat)
         numerator = np.asarray(filled @ apply_weights)

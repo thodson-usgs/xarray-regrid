@@ -65,11 +65,11 @@ class _Direction:
     """
 
     def __init__(self, areas: AreaMatrix) -> None:
-        self.matrix = _weights.WeightMatrix(areas)
+        self.areas = areas
 
     @cached_property
     def weights(self) -> AreaMatrix:
-        return self.matrix.row_normalized()
+        return _weights.row_normalize(self.areas)
 
     @cached_property
     def apply_matrix(self) -> AreaMatrix:
@@ -77,7 +77,7 @@ class _Direction:
 
     @cached_property
     def coverage(self) -> np.ndarray:
-        return self.matrix.coverage()
+        return _weights.coverage_mask(self.areas)
 
     @cached_property
     def coverage_all(self) -> bool:
@@ -142,9 +142,7 @@ class ConservativeRegridder:
             n_threads=n_threads,
         )
         if src_x_sort_idx is not None:
-            # Source x was sorted by _normalize_longitude_coords so polygon
-            # construction stayed monotone. Relabel matrix columns so column
-            # order matches the user's original (unsorted) data layout.
+            # Undo the source-x pre-sort so columns align with the user's input layout.
             x_dim_index = src_dims.index(source[x_coord].dims[0])
             areas = _geom.remap_columns_for_axis_sort(
                 areas, src_x_sort_idx, self._src_shape, x_dim_index
@@ -172,7 +170,7 @@ class ConservativeRegridder:
 
     @cached_property
     def _backward(self) -> _Direction:
-        return _Direction(_weights.WeightMatrix(self.areas).transposed())
+        return _Direction(_weights.transpose_weights(self.areas))
 
     @property
     def forward_weights(self) -> AreaMatrix:
@@ -187,12 +185,12 @@ class ConservativeRegridder:
     @property
     def target_areas(self) -> np.ndarray:
         """Area of each target cell overlapped by the source domain."""
-        return _weights.WeightMatrix(self.areas).sum_axis(axis=1)
+        return _weights.sum_matrix_axis_1d(self.areas, axis=1)
 
     @property
     def source_coverage_areas(self) -> np.ndarray:
         """Area of each source cell covered by target cells."""
-        return _weights.WeightMatrix(self.areas).sum_axis(axis=0)
+        return _weights.sum_matrix_axis_1d(self.areas, axis=0)
 
     def regrid(
         self,
@@ -219,9 +217,8 @@ class ConservativeRegridder:
         return self.regrid(data, skipna=skipna, nan_threshold=nan_threshold)
 
     def transpose(self) -> "ConservativeRegridder":
-        """Return the backward regridder (target → source). The original's
-        forward Direction becomes the new's backward (and vice versa), so any
-        already-computed weight matrices are reused, not recomputed."""
+        """Return the backward regridder (target → source). Cached forward
+        and backward weight matrices are swapped, not recomputed."""
         new = type(self)._from_state(
             areas=_weights.transpose_weights(self.areas),
             source_coords=self._target_coords,
@@ -298,9 +295,8 @@ class ConservativeRegridder:
         target_coords: xr.Dataset,
         spec: RegridSpec,
     ) -> "ConservativeRegridder":
-        """Construct a regridder directly from its canonical state. Shared
-        bypass of ``__init__`` used by :meth:`from_netcdf` and
-        :meth:`from_polygons`; keeps the list of private attrs in one place."""
+        """Construct a regridder directly from its canonical state, bypassing
+        the geometry intersection in ``__init__``."""
         instance = object.__new__(cls)
         instance.x_coord = spec.x_coord
         instance.y_coord = spec.y_coord
@@ -378,8 +374,6 @@ class ConservativeRegridder:
         )
         return cls._from_state(
             areas=_weights.build_intersection_areas(
-                # preserve current default behavior for user-supplied polygons
-                # where predicate filtering is typically beneficial
                 src_grid,
                 dst_grid,
                 n_threads=n_threads,

@@ -9,14 +9,9 @@ from xarray_regrid import utils
 from xarray_regrid.methods.conservative_2d._deps import (
     HAS_SPARSE,
     affinity,
-    require_shapely,
     shapely,
     sparse,
 )
-
-
-def check_shapely() -> None:
-    require_shapely()
 
 
 @dataclass
@@ -141,7 +136,6 @@ def grid_from_coords(
 
 
 def build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> Grid:
-    check_shapely()
     if lon_centers.size < 2 or lat_centers.size < 2:
         msg = "spherical mode requires at least two cells per dimension"
         raise ValueError(msg)
@@ -179,7 +173,6 @@ def rect_grid_from_edges(xe: np.ndarray, ye: np.ndarray) -> Grid:
 
 
 def build_grid(xc: np.ndarray, yc: np.ndarray) -> Grid:
-    check_shapely()
     if xc.ndim == 1 and yc.ndim == 1:
         xe = utils.infer_1d_edges(xc.astype(float))
         ye = utils.infer_1d_edges(yc.astype(float))
