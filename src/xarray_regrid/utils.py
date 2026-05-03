@@ -114,6 +114,19 @@ def create_regridding_dataset(
     )
 
 
+def wrap_longitudes_to_target_window(
+    values: np.ndarray, target_first: float, target_last: float
+) -> np.ndarray:
+    """Per-value wrap of ``values`` (degrees) into a single 360° window
+    centered between the target endpoints. Used to align cross-convention
+    longitudes (source on ``[0, 360]`` vs target on ``[-180, 180]`` and
+    vice versa). The wrap point is ``(first + last + 360) / 2``."""
+    wrap_point = float(target_first + target_last + 360.0) / 2.0
+    values = np.where(values < wrap_point - 360.0, values + 360.0, values)
+    values = np.where(values > wrap_point, values - 360.0, values)
+    return values
+
+
 def infer_1d_edges(centers: np.ndarray) -> np.ndarray:
     """Return cell edges from 1D centers: midpoints between consecutive
     centers, with symmetric reflection for the two outer bounds.
@@ -362,11 +375,9 @@ def format_lon(
     # This ensures we have coverage on the target and handles global > regional
     source_vals = obj.coords[lon_coord].values
     target_vals = target.coords[lon_coord].values
-    wrap_point = (target_vals[-1] + target_vals[0] + 360) / 2
-    source_vals = np.where(
-        source_vals < wrap_point - 360, source_vals + 360, source_vals
+    source_vals = wrap_longitudes_to_target_window(
+        source_vals, float(target_vals[0]), float(target_vals[-1])
     )
-    source_vals = np.where(source_vals > wrap_point, source_vals - 360, source_vals)
     obj = update_coord(obj, lon_coord, source_vals)
 
     obj = ensure_monotonic(obj, lon_coord)

@@ -1,5 +1,5 @@
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -13,3 +13,13 @@ class RegridSpec:
     x_coord: str
     y_coord: str
     spherical: bool
+
+    def transposed(self) -> "RegridSpec":
+        """Swap source and target — same layout, opposite direction."""
+        return replace(
+            self,
+            src_dims=self.dst_dims,
+            dst_dims=self.src_dims,
+            src_shape=self.dst_shape,
+            dst_shape=self.src_shape,
+        )

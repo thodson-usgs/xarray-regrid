@@ -17,9 +17,10 @@ Requires ``shapely >= 2.0``. If ``sparse`` is available, the weight matrix is
 stored as ``sparse.COO``; otherwise a dense numpy matrix is used.
 """
 
+import math
 import os
 import warnings
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
@@ -95,7 +96,7 @@ class _Direction:
     - ``apply_matrix``: pre-transposed and index-sorted weights, so
       ``_apply_core``'s matmul is ``(..., n_src) @ (n_src, n_dst)`` with no
       per-call sort
-    - ``coverage`` / ``coverage_all``: which output cells have any source overlap
+    - ``coverage``: which output cells have any source overlap
 
     A regridder holds two of these (forward, backward); transposing the
     regridder swaps them with no recomputation.
@@ -115,10 +116,6 @@ class _Direction:
     @cached_property
     def coverage(self) -> np.ndarray:
         return _coverage_mask(self.areas)
-
-    @cached_property
-    def coverage_all(self) -> bool:
-        return bool(self.coverage.all())
 
 
 class ConservativeRegridder:
@@ -159,45 +156,63 @@ class ConservativeRegridder:
         if not dst_dims:
             msg = f"target has no dims for coords {x_coord!r}, {y_coord!r}"
             raise ValueError(msg)
+        spec = RegridSpec(
+            src_dims=src_dims,
+            dst_dims=dst_dims,
+            src_shape=tuple(int(source.sizes[d]) for d in src_dims),
+            dst_shape=tuple(int(target.sizes[d]) for d in dst_dims),
+            x_coord=x_coord,
+            y_coord=y_coord,
+            spherical=spherical,
+        )
         src_grid = _grid_from_coords(
             source_grid, x_coord, y_coord, src_dims, spherical=spherical
         )
         dst_grid = _grid_from_coords(
             target_grid, x_coord, y_coord, dst_dims, spherical=spherical
         )
-        self.spherical = spherical
-
-        self.x_coord = x_coord
-        self.y_coord = y_coord
-        self._src_dims = src_dims
-        self._dst_dims = dst_dims
-        self._src_shape = tuple(int(source.sizes[d]) for d in src_dims)
-        self._dst_shape = tuple(int(target.sizes[d]) for d in dst_dims)
         areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
         if src_x_sort_idx is not None:
-            # Source x was sorted by _normalize_longitude_coords so polygon
-            # construction stayed monotone. Relabel matrix columns so column
-            # order matches the user's original (unsorted) data layout.
             x_dim_index = src_dims.index(source[x_coord].dims[0])
             areas = _remap_columns_for_axis_sort(
-                areas, src_x_sort_idx, self._src_shape, x_dim_index
+                areas, src_x_sort_idx, spec.src_shape, x_dim_index
             )
+        self._init_state(
+            areas=areas,
+            source_coords=source.coords.to_dataset(),
+            target_coords=target.coords.to_dataset(),
+            spec=spec,
+        )
+
+    def _init_state(
+        self,
+        *,
+        areas: "sparse.COO | np.ndarray",
+        source_coords: xr.Dataset,
+        target_coords: xr.Dataset,
+        spec: RegridSpec,
+    ) -> None:
         self.areas = areas
-        self._source_coords = source.coords.to_dataset()
-        self._target_coords = target.coords.to_dataset()
+        self._source_coords = source_coords
+        self._target_coords = target_coords
+        self._spec = spec
 
     @property
     def spec(self) -> RegridSpec:
         """Canonical metadata describing this regridder's layout."""
-        return RegridSpec(
-            src_dims=self._src_dims,
-            dst_dims=self._dst_dims,
-            src_shape=self._src_shape,
-            dst_shape=self._dst_shape,
-            x_coord=self.x_coord,
-            y_coord=self.y_coord,
-            spherical=self.spherical,
-        )
+        return self._spec
+
+    @property
+    def x_coord(self) -> str:
+        return self._spec.x_coord
+
+    @property
+    def y_coord(self) -> str:
+        return self._spec.y_coord
+
+    @property
+    def spherical(self) -> bool:
+        return self._spec.spherical
 
     @cached_property
     def _forward(self) -> _Direction:
@@ -259,15 +274,7 @@ class ConservativeRegridder:
             areas=_transpose_weights(self.areas),
             source_coords=self._target_coords,
             target_coords=self._source_coords,
-            spec=RegridSpec(
-                src_dims=self._dst_dims,
-                dst_dims=self._src_dims,
-                src_shape=self._dst_shape,
-                dst_shape=self._src_shape,
-                x_coord=self.x_coord,
-                y_coord=self.y_coord,
-                spherical=self.spherical,
-            ),
+            spec=self._spec.transposed(),
         )
         if "_forward" in self.__dict__:
             new.__dict__["_backward"] = self.__dict__["_forward"]
@@ -285,8 +292,8 @@ class ConservativeRegridder:
         shape = getattr(self.areas, "shape", (None, None))
         nnz_str = f"nnz={nnz}" if nnz is not None else "dense"
         return (
-            f"ConservativeRegridder(src_dims={self._src_dims}, "
-            f"dst_dims={self._dst_dims}, {shape[0]}x{shape[1]}, {nnz_str})"
+            f"ConservativeRegridder(src_dims={self._spec.src_dims}, "
+            f"dst_dims={self._spec.dst_dims}, {shape[0]}x{shape[1]}, {nnz_str})"
         )
 
     def to_netcdf(self, path: str | Path, engine: NetcdfEngine = None) -> None:
@@ -357,18 +364,14 @@ class ConservativeRegridder:
     ) -> "ConservativeRegridder":
         """Construct a regridder directly from its canonical state. Shared
         bypass of ``__init__`` used by :meth:`from_netcdf` and
-        :meth:`from_polygons`; keeps the list of private attrs in one place."""
+        :meth:`from_polygons`."""
         instance = object.__new__(cls)
-        instance.x_coord = spec.x_coord
-        instance.y_coord = spec.y_coord
-        instance.spherical = spec.spherical
-        instance._src_dims = spec.src_dims
-        instance._dst_dims = spec.dst_dims
-        instance._src_shape = spec.src_shape
-        instance._dst_shape = spec.dst_shape
-        instance.areas = areas
-        instance._source_coords = source_coords
-        instance._target_coords = target_coords
+        instance._init_state(
+            areas=areas,
+            source_coords=source_coords,
+            target_coords=target_coords,
+            spec=spec,
+        )
         return instance
 
     @classmethod
@@ -506,13 +509,14 @@ def _apply_stored_weights(
     data_renamed = data.rename(dict(zip(spec.src_dims, src_tokens, strict=True)))
 
     output_dtype = _result_dtype(data)
+    coverage = direction.coverage
     result = xr.apply_ufunc(
         _apply_core,
         data_renamed,
         kwargs={
             "apply_weights": direction.apply_matrix,
-            "coverage": direction.coverage,
-            "coverage_all": direction.coverage_all,
+            "coverage": coverage,
+            "coverage_all": bool(coverage.all()),
             "src_shape": spec.src_shape,
             "dst_shape": spec.dst_shape,
             "skipna": skipna,
@@ -531,13 +535,7 @@ def _apply_stored_weights(
         keep_attrs=True,
     )
 
-    return _assign_target_coords(
-        result,
-        target_coords,
-        spec.dst_dims,
-        spec.x_coord,
-        spec.y_coord,
-    )
+    return _assign_target_coords(result, target_coords, spec)
 
 
 def _coverage_mask(areas: "sparse.COO | np.ndarray") -> np.ndarray:
@@ -600,11 +598,11 @@ def _normalize_longitude_coords(
     ):
         # Per-value wrap source into target's 360° window — mirrors format_lon
         # so source [0, 360] vs target [-180, 180] (and either reversed)
-        # aligns. A uniform offset can't reconcile cross-convention grids:
-        # mean diff is exactly 180° and round() is banker's-rounded to 0.
-        wrap_point = float((tgt_finite[0] + tgt_finite[-1] + 360.0) / 2.0)
-        source_x = np.where(source_x < wrap_point - 360.0, source_x + 360.0, source_x)
-        source_x = np.where(source_x > wrap_point, source_x - 360.0, source_x)
+        # aligns. A uniform offset can't reconcile cross-convention grids
+        # (mean diff is exactly 180° and round() is banker's-rounded to 0).
+        source_x = utils.wrap_longitudes_to_target_window(
+            source_x, float(tgt_finite[0]), float(tgt_finite[-1])
+        )
         diffs = np.diff(source_x)
         if not (np.all(diffs > 0) or np.all(diffs < 0)):
             src_x_sort_idx = np.argsort(source_x, kind="stable")
@@ -673,9 +671,17 @@ def _polygon_center_x(polygon: Any) -> float:
 
 
 def _periodic_offset(reference: float, value: float) -> float:
+    """Smallest multiple of 360° that brings ``value`` close to ``reference``.
+
+    Half-up symmetric rounding (not Python's banker's ``round()``): for
+    antipodal pairs (``reference - value`` exactly ±180°) we always shift by
+    ±360° rather than tying to zero, so the polygon ends up adjacent to
+    ``reference`` instead of being silently left antipodal.
+    """
     if not np.isfinite(reference) or not np.isfinite(value):
         return 0.0
-    return 360.0 * round((reference - value) / 360.0)
+    diff = (reference - value) / 360.0
+    return 360.0 * math.copysign(math.floor(abs(diff) + 0.5), diff)
 
 
 def _unwrap_polygon(polygon: Any) -> Any:
@@ -692,15 +698,7 @@ def _unwrap_polygon(polygon: Any) -> Any:
 
 def _unwrap_ring(ring: np.ndarray) -> np.ndarray:
     new_ring = np.asarray(ring, dtype=float).copy()
-    offset = 0.0
-    for i in range(1, new_ring.shape[0]):
-        x = new_ring[i, 0] + offset
-        step = x - new_ring[i - 1, 0]
-        if step > 180.0:
-            offset -= 360.0
-        elif step < -180.0:
-            offset += 360.0
-        new_ring[i, 0] += offset
+    new_ring[:, 0] = np.unwrap(new_ring[:, 0], period=360.0)
     return new_ring
 
 
@@ -714,30 +712,17 @@ def _remap_columns_for_axis_sort(
     matrix so that columns appear in the user's original source-data order
     after ``sort_idx`` was applied along ``axis_index`` of ``src_shape``.
 
-    A row-major source flat index ``c = unravel(c, src_shape)`` has its
-    ``axis_index`` component ``i_sorted`` permuted via
-    ``i_orig = sort_idx[i_sorted]``; all other components are untouched. So
-    the new flat index is
-    ``c_new = c // stride * stride + (i_orig - i_sorted) * inner + ...``.
-    For separable 1D-rect grids (the only case that triggers this today) the
-    sorted axis sits between an outer block of size ``outer`` and an inner
-    block of size ``inner`` with ``stride = nx * inner``.
+    For sparse, we permute the existing ``coords[1]`` column indices forward
+    via ``sort_idx``. For dense, we fancy-index columns by the inverse
+    permutation. Both express the same unravel/permute/ravel operation.
     """
-    nx = int(src_shape[axis_index])
-    inner = int(np.prod(src_shape[axis_index + 1 :]))
-    stride = nx * inner
     sort_idx = np.asarray(sort_idx, dtype=np.int64)
+    permute = _axis_index_permuter(src_shape, axis_index)
 
     if _HAS_SPARSE and isinstance(areas, sparse.COO):
-        old_col = np.asarray(areas.coords[1], dtype=np.int64)
-        outer_block = (old_col // stride) * stride
-        within = old_col % stride
-        i_sorted = within // inner
-        rest = within % inner
-        new_col = outer_block + sort_idx[i_sorted] * inner + rest
-        coords = np.stack([np.asarray(areas.coords[0], dtype=np.int64), new_col])
+        new_col = permute(np.asarray(areas.coords[1], dtype=np.int64), sort_idx)
         return sparse.COO(
-            coords=coords,
+            coords=np.stack([np.asarray(areas.coords[0], dtype=np.int64), new_col]),
             data=np.asarray(areas.data),
             shape=areas.shape,
             has_duplicates=False,
@@ -745,16 +730,28 @@ def _remap_columns_for_axis_sort(
         )
 
     arr = np.asarray(areas)
-    n_cells = arr.shape[1]
-    inv_sort_idx = np.empty_like(sort_idx)
-    inv_sort_idx[sort_idx] = np.arange(sort_idx.size, dtype=sort_idx.dtype)
-    cells = np.arange(n_cells, dtype=np.int64)
-    outer_block = (cells // stride) * stride
-    within = cells % stride
-    i_orig = within // inner
-    rest = within % inner
-    inv_perm = outer_block + inv_sort_idx[i_orig] * inner + rest
+    inv_sort = np.empty_like(sort_idx)
+    inv_sort[sort_idx] = np.arange(sort_idx.size, dtype=sort_idx.dtype)
+    inv_perm = permute(np.arange(arr.shape[1], dtype=np.int64), inv_sort)
     return arr[:, inv_perm]
+
+
+def _axis_index_permuter(
+    src_shape: tuple[int, ...], axis_index: int
+) -> "Callable[[np.ndarray, np.ndarray], np.ndarray]":
+    """Return ``permute(flat_indices, lookup)`` that permutes the
+    ``axis_index`` component of each row-major flat index via ``lookup``,
+    leaving all other components untouched."""
+    nx = int(src_shape[axis_index])
+    inner = int(np.prod(src_shape[axis_index + 1 :]))
+    stride = nx * inner
+
+    def permute(flat: np.ndarray, lookup: np.ndarray) -> np.ndarray:
+        outer = (flat // stride) * stride
+        within = flat % stride
+        return outer + lookup[within // inner] * inner + within % inner
+
+    return permute
 
 
 def _transpose_weights(
@@ -994,20 +991,7 @@ def _build_intersection_areas(
     src_idx = src_idx[keep]
     areas = areas[keep]
 
-    if dst_idx.size == 0:
-        return _empty_weights(n_dst, n_src)
-
-    if _HAS_SPARSE:
-        return sparse.COO(
-            coords=np.stack([dst_idx, src_idx]),
-            data=areas.astype(np.float64),
-            shape=(n_dst, n_src),
-            has_duplicates=False,
-            sorted=False,
-        )
-    a_dense = np.zeros((n_dst, n_src), dtype=np.float64)
-    a_dense[dst_idx, src_idx] = areas
-    return a_dense
+    return _coo_or_dense(dst_idx, src_idx, areas.astype(np.float64), (n_dst, n_src))
 
 
 def _row_normalize(
@@ -1067,13 +1051,29 @@ def _intersection_areas_threaded(
 
 
 def _empty_weights(n_dst: int, n_src: int) -> "sparse.COO | np.ndarray":
+    empty = np.zeros(0, dtype=np.int64)
+    return _coo_or_dense(empty, empty, np.zeros(0, dtype=np.float64), (n_dst, n_src))
+
+
+def _coo_or_dense(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    data: np.ndarray,
+    shape: tuple[int, int],
+) -> "sparse.COO | np.ndarray":
+    """Build a ``sparse.COO`` if available, else a dense ndarray."""
     if _HAS_SPARSE:
         return sparse.COO(
-            coords=np.zeros((2, 0), dtype=np.int64),
-            data=np.zeros(0, dtype=np.float64),
-            shape=(n_dst, n_src),
+            coords=np.stack([rows, cols]),
+            data=data,
+            shape=shape,
+            has_duplicates=False,
+            sorted=False,
         )
-    return np.zeros((n_dst, n_src), dtype=np.float64)
+    arr = np.zeros(shape, dtype=data.dtype if data.size else np.float64)
+    if data.size:
+        arr[rows, cols] = data
+    return arr
 
 
 def _apply_core(
@@ -1117,11 +1117,18 @@ def _apply_core(
         threshold = get_valid_threshold(nan_threshold)
         with np.errstate(invalid="ignore", divide="ignore"):
             result = numerator / fraction
-        result = np.where(fraction >= threshold, result, np.nan)
+        valid = fraction >= threshold
     else:
         result = np.asarray(flat @ apply_weights)
-        if not coverage_all:
-            result = np.where(coverage[np.newaxis, :], result, np.nan)
+        valid = None
+    # Always mask domain-uncovered cells. With NaNs the uncovered rows already
+    # have fraction=0 (so the threshold check below catches them), but ANDing
+    # coverage in keeps the contract explicit and robust to threshold tweaks.
+    if not coverage_all:
+        cov = coverage[np.newaxis, :]
+        valid = cov if valid is None else (valid & cov)
+    if valid is not None:
+        result = np.where(valid, result, np.nan)
 
     # sparse.matmul promotes to float64 regardless of the input dtype — cast
     # back to the requested output dtype so float32-in really produces
@@ -1145,17 +1152,16 @@ def _result_dtype(obj: xr.DataArray | xr.Dataset) -> np.dtype:
 def _assign_target_coords(
     obj: xr.DataArray | xr.Dataset,
     target_ds: xr.Dataset,
-    dst_dims: tuple[Hashable, ...],
-    x_coord: str,
-    y_coord: str,
+    spec: RegridSpec,
 ) -> xr.DataArray | xr.Dataset:
     """Attach target coordinates that name a spatial axis or live on the
     output spatial dims. Scalar coords (``dims == ()``) ride along too, so
     pinned target metadata (e.g. a fixed timestamp) is preserved."""
-    dst_dim_set = set(dst_dims)
+    dst_dim_set = set(spec.dst_dims)
+    spatial = (spec.x_coord, spec.y_coord)
     new_coords = {
         name: coord
         for name, coord in target_ds.coords.items()
-        if name in (x_coord, y_coord) or set(coord.dims).issubset(dst_dim_set)
+        if name in spatial or set(coord.dims).issubset(dst_dim_set)
     }
     return obj.assign_coords(new_coords) if new_coords else obj

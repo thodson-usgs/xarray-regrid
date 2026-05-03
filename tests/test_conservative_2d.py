@@ -198,8 +198,10 @@ def test_regridder_weight_cache():
     da = _rect_da()
     target = _rect_target()
     regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
-    assert "forward_weights" not in regridder.__dict__
+    # _forward is a cached_property; not yet materialized before first regrid.
+    assert "_forward" not in regridder.__dict__
     regridder.regrid(da)
+    assert "_forward" in regridder.__dict__
     w1 = regridder.forward_weights
     regridder.regrid(da)
     assert regridder.forward_weights is w1  # same object, not rebuilt
@@ -561,11 +563,7 @@ def test_to_netcdf_roundtrip_structured(tmp_path):
     rgr2 = ConservativeRegridder.from_netcdf(path)
 
     np.testing.assert_array_equal(rgr2.regrid(da).values, out_before)
-    assert rgr2.x_coord == "x"
-    assert rgr2.y_coord == "y"
-    assert rgr2.spherical is False
-    assert rgr2._src_dims == rgr._src_dims
-    assert rgr2._dst_dims == rgr._dst_dims
+    assert rgr2.spec == rgr.spec
 
 
 def test_to_netcdf_preserves_spherical_flag(tmp_path):
@@ -642,8 +640,8 @@ def test_to_netcdf_metadata_fields(tmp_path):
     assert attrs["x_coord"] == "x"
     assert attrs["y_coord"] == "y"
     assert bool(int(attrs["spherical"])) is False
-    assert tuple(int(size) for size in attrs["src_shape"]) == rgr._src_shape
-    assert tuple(int(size) for size in attrs["dst_shape"]) == rgr._dst_shape
+    assert tuple(int(size) for size in attrs["src_shape"]) == rgr.spec.src_shape
+    assert tuple(int(size) for size in attrs["dst_shape"]) == rgr.spec.dst_shape
     # Grid ranges captured when the coord is present in source/target.
     assert "source_x_range" in attrs
     assert "target_x_range" in attrs
