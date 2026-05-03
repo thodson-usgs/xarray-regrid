@@ -1,5 +1,13 @@
 from collections.abc import Hashable
 from dataclasses import dataclass, replace
+from typing import Literal
+
+# Geometry backend used to build cell polygons and compute their intersections.
+# - "planar": raw shapely on the user's coords
+# - "cea": Lambert cylindrical equal-area projection of 1D lat/lon (degrees)
+#          — analytic spherical areas at planar cost
+# Future backends (e.g. true great-circle "s2") plug in via _GRID_BUILDERS.
+Manifold = Literal["planar", "cea"]
 
 
 @dataclass(frozen=True)
@@ -12,7 +20,7 @@ class RegridSpec:
     dst_shape: tuple[int, ...]
     x_coord: str
     y_coord: str
-    spherical: bool
+    manifold: Manifold
 
     def transposed(self) -> "RegridSpec":
         """Swap source and target — same layout, opposite direction."""

@@ -73,7 +73,7 @@ def _metadata_attrs(
     attrs: dict[str, Any] = {
         "x_coord": spec.x_coord,
         "y_coord": spec.y_coord,
-        "spherical": int(spec.spherical),
+        "manifold": spec.manifold,
         "src_dims": [str(d) for d in spec.src_dims],
         "dst_dims": [str(d) for d in spec.dst_dims],
         "src_shape": list(spec.src_shape),
@@ -104,10 +104,11 @@ def _metadata_from_attrs(attrs: dict[str, Any], path: Path) -> RegridSpec:
         )
         raise ValueError(msg)
 
+    manifold = str(attrs["manifold"])
     return RegridSpec(
         x_coord=str(attrs["x_coord"]),
         y_coord=str(attrs["y_coord"]),
-        spherical=bool(int(attrs["spherical"])),
+        manifold=manifold,  # type: ignore[arg-type]
         src_dims=tuple(str(d) for d in np.atleast_1d(attrs["src_dims"])),
         dst_dims=tuple(str(d) for d in np.atleast_1d(attrs["dst_dims"])),
         src_shape=tuple(int(s) for s in np.atleast_1d(attrs["src_shape"])),

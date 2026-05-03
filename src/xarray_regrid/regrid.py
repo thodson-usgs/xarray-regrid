@@ -96,7 +96,7 @@ class Regridder:
         ds_target_grid: xr.Dataset,
         x_coord: str = "longitude",
         y_coord: str = "latitude",
-        spherical: bool = False,
+        manifold: conservative_2d.Manifold = "planar",
         time_dim: str | None = "time",
         skipna: bool = True,
         nan_threshold: float = 1.0,
@@ -107,7 +107,7 @@ class Regridder:
         Use this when ``.conservative`` can't express your grid: curvilinear
         coordinates (2D ``lat``/``lon`` arrays), unstructured meshes, or any
         arbitrary polygon target. Computes 2D cell-polygon intersections via
-        shapely. Defaults to planar geometry; set ``spherical=True`` for
+        shapely. Defaults to planar geometry; set ``manifold="cea"`` for
         lat/lon grids in degrees to get proper spherical area weights via an
         analytic cylindrical equal-area projection. Requires ``shapely >= 2.0``.
 
@@ -116,9 +116,11 @@ class Regridder:
                 ``x_coord`` and ``y_coord`` as coordinate variables.
             x_coord: Name of the x (longitude-like) coordinate variable.
             y_coord: Name of the y (latitude-like) coordinate variable.
-            spherical: If True, assume coords are longitude/latitude in
-                degrees and apply a Lambert cylindrical equal-area projection
-                before intersecting. Rectilinear (1D coord) grids only.
+            manifold: Geometry backend. ``"planar"`` (default) intersects
+                shapely polygons in the user's coord space. ``"cea"`` projects
+                1D rectilinear lat/lon (degrees) into Lambert cylindrical
+                equal-area space before intersecting — proper spherical
+                areas at planar cost.
             time_dim: Name of the time dimension. Defaults to ``"time"``. Use
                 ``None`` to force regridding over the time dimension.
             skipna: If True, propagate NaNs into the weighted mean via a
@@ -142,7 +144,7 @@ class Regridder:
             ds_target_grid,
             x_coord=x_coord,
             y_coord=y_coord,
-            spherical=spherical,
+            manifold=manifold,
             n_threads=n_threads,
         )
         return regridder.regrid(self._obj, skipna=skipna, nan_threshold=nan_threshold)

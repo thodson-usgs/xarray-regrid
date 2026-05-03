@@ -37,7 +37,7 @@ from xarray_regrid.methods._conservative_2d_serialization import (
     _metadata_attrs,
     _metadata_from_attrs,
 )
-from xarray_regrid.methods._conservative_2d_spec import RegridSpec
+from xarray_regrid.methods._conservative_2d_spec import Manifold, RegridSpec
 from xarray_regrid.methods.conservative import get_valid_threshold
 
 NetcdfEngine = Literal["netcdf4", "scipy", "h5netcdf"] | None
@@ -141,10 +141,11 @@ class ConservativeRegridder:
         target: xr.Dataset,
         x_coord: str = "longitude",
         y_coord: str = "latitude",
-        spherical: bool = False,
+        manifold: Manifold = "planar",
         n_threads: int | None = None,
     ) -> None:
         _check_shapely()
+        _check_manifold(manifold)
         source_grid, target_grid, src_x_sort_idx = _normalize_longitude_coords(
             source, target, x_coord
         )
@@ -163,14 +164,10 @@ class ConservativeRegridder:
             dst_shape=tuple(int(target.sizes[d]) for d in dst_dims),
             x_coord=x_coord,
             y_coord=y_coord,
-            spherical=spherical,
+            manifold=manifold,
         )
-        src_grid = _grid_from_coords(
-            source_grid, x_coord, y_coord, src_dims, spherical=spherical
-        )
-        dst_grid = _grid_from_coords(
-            target_grid, x_coord, y_coord, dst_dims, spherical=spherical
-        )
+        src_grid = _grid_from_coords(source_grid, x_coord, y_coord, src_dims, manifold)
+        dst_grid = _grid_from_coords(target_grid, x_coord, y_coord, dst_dims, manifold)
         areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
         if src_x_sort_idx is not None:
             x_dim_index = src_dims.index(source[x_coord].dims[0])
@@ -211,8 +208,8 @@ class ConservativeRegridder:
         return self._spec.y_coord
 
     @property
-    def spherical(self) -> bool:
-        return self._spec.spherical
+    def manifold(self) -> Manifold:
+        return self._spec.manifold
 
     @cached_property
     def _forward(self) -> _Direction:
@@ -405,7 +402,7 @@ class ConservativeRegridder:
 
         Geometry is planar in the polygons' own coordinate space. For lat/lon
         cells, project into an equal-area CRS first or use the structured
-        path with ``spherical=True``.
+        path with ``manifold="cea"``.
         """
         _check_shapely()
         src_polys = np.asarray(source_polygons)
@@ -452,7 +449,7 @@ class ConservativeRegridder:
                 dst_shape=(n_dst,),
                 x_coord="",
                 y_coord="",
-                spherical=False,
+                manifold="planar",
             ),
         )
 
@@ -460,22 +457,23 @@ class ConservativeRegridder:
 def polygons_from_coords(
     x: np.ndarray,
     y: np.ndarray,
-    spherical: bool = False,
+    manifold: Manifold = "planar",
     periodic: bool = False,
 ) -> np.ndarray:
     """Build a 1D row-major (y, x) array of shapely cell polygons from 1D or
     2D center coords. Convenience for mixing structured and unstructured paths
-    via :meth:`ConservativeRegridder.from_polygons`. ``spherical=True``
+    via :meth:`ConservativeRegridder.from_polygons`. ``manifold="cea"``
     projects 1D lat/lon (degrees) into Lambert cylindrical equal-area space;
     ``periodic=True`` unwraps antimeridian-crossing cells."""
     _check_shapely()
+    _check_manifold(manifold)
     x = np.asarray(x)
     y = np.asarray(y)
     if periodic:
         x = _unwrap_longitude(x)
-    if spherical:
+    if manifold == "cea":
         if x.ndim != 1 or y.ndim != 1:
-            msg = "spherical=True requires 1D lat/lon arrays"
+            msg = 'manifold="cea" requires 1D lat/lon arrays'
             raise ValueError(msg)
         return _build_cea_grid(x, y).polys
     return _build_grid(x, y).polys
@@ -804,37 +802,65 @@ def _grid_from_coords(
     x_coord: str,
     y_coord: str,
     dims: tuple[Hashable, ...],
-    spherical: bool = False,
+    manifold: Manifold = "planar",
 ) -> "_Grid":
-    """Build a :class:`_Grid` from the object's x/y coordinates.
+    """Build a :class:`_Grid` from the object's x/y coordinates, dispatched
+    by ``manifold`` via :data:`_GRID_BUILDERS`."""
+    return _GRID_BUILDERS[manifold](obj, x_coord, y_coord, dims)
 
-    Rectilinear (both coords 1D on separate dims) takes the fast path.
-    Curvilinear coords are broadcast to a common N-D array in ``dims`` order.
 
-    If ``spherical`` is True, coordinates are assumed to be longitude (x) and
-    latitude (y) in degrees, and cells are projected into a Lambert cylindrical
-    equal-area space (x' = lon_rad, y' = sin(lat_rad)) before constructing the
-    cell polygons. This gives mass-conservative weights on the sphere at the
-    same cost as the planar fast path. Rectilinear-only.
-    """
+def _build_planar_from_coords(
+    obj: xr.DataArray | xr.Dataset,
+    x_coord: str,
+    y_coord: str,
+    dims: tuple[Hashable, ...],
+) -> "_Grid":
+    """Planar shapely polygons. Rectilinear (both coords 1D on separate dims)
+    takes the fast path; curvilinear coords are broadcast to a common N-D
+    array in ``dims`` order."""
     xd = obj[x_coord]
     yd = obj[y_coord]
-    is_rectilinear = xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]
-
-    if spherical and not is_rectilinear:
-        msg = "spherical=True is only supported for rectilinear (1D lat/lon) coords"
-        raise NotImplementedError(msg)
-
-    if is_rectilinear:
-        x = np.asarray(xd.values)
-        y = np.asarray(yd.values)
-        return _build_cea_grid(x, y) if spherical else _build_grid(x, y)
-
+    if xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]:
+        return _build_grid(np.asarray(xd.values), np.asarray(yd.values))
     xc, yc = xr.broadcast(xd, yd)
     return _build_grid(
         np.asarray(xc.transpose(*dims).values),
         np.asarray(yc.transpose(*dims).values),
     )
+
+
+def _build_cea_from_coords(
+    obj: xr.DataArray | xr.Dataset,
+    x_coord: str,
+    y_coord: str,
+    dims: tuple[Hashable, ...],  # noqa: ARG001 — dispatched signature
+) -> "_Grid":
+    """Lambert cylindrical equal-area polygons from 1D rectilinear lat/lon
+    centers (degrees). Cells are projected (x' = lon_rad, y' = sin(lat_rad))
+    before construction, giving mass-conservative weights on the sphere at
+    the same cost as the planar fast path. Rectilinear-only."""
+    xd = obj[x_coord]
+    yd = obj[y_coord]
+    if not (xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]):
+        msg = 'manifold="cea" is only supported for rectilinear (1D lat/lon) coords'
+        raise NotImplementedError(msg)
+    return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
+
+
+# Registry of geometry backends. Each builder takes the same
+# ``(obj, x_coord, y_coord, dims)`` and returns a ``_Grid``. New manifolds
+# (e.g. true great-circle ``"s2"``) plug in via a single insert.
+_GRID_BUILDERS: dict[str, Callable[..., "_Grid"]] = {
+    "planar": _build_planar_from_coords,
+    "cea": _build_cea_from_coords,
+}
+
+
+def _check_manifold(manifold: str) -> None:
+    if manifold not in _GRID_BUILDERS:
+        valid = ", ".join(repr(m) for m in sorted(_GRID_BUILDERS))
+        msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
+        raise ValueError(msg)
 
 
 def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
@@ -848,7 +874,7 @@ def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid"
     """
     _check_shapely()
     if lon_centers.size < 2 or lat_centers.size < 2:
-        msg = "spherical mode requires at least two cells per dimension"
+        msg = 'manifold="cea" requires at least two cells per dimension'
         raise ValueError(msg)
     lat_edges_deg = np.clip(utils.infer_1d_edges(lat_centers), -90.0, 90.0)
     lon_edges_deg = utils.infer_1d_edges(lon_centers)
