@@ -129,11 +129,11 @@ def test_cross_convention_longitude_alignment():
     out_planar = da.regrid.conservative_2d(
         target, x_coord="longitude", y_coord="latitude"
     ).transpose("latitude", "longitude")
-    out_spherical = da.regrid.conservative_2d(
-        target, x_coord="longitude", y_coord="latitude", spherical=True
+    out_cea = da.regrid.conservative_2d(
+        target, x_coord="longitude", y_coord="latitude", manifold="cea"
     ).transpose("latitude", "longitude")
     np.testing.assert_allclose(out_planar.values, expected.values, atol=1e-12)
-    np.testing.assert_allclose(out_spherical.values, expected.values, atol=1e-12)
+    np.testing.assert_allclose(out_cea.values, expected.values, atol=1e-12)
 
     # Reverse: source on [-180, 180], target on [0, 360].
     da_rev = xr.DataArray(
@@ -158,6 +158,14 @@ def test_polygon_nan_threshold_invalid():
     with pytest.raises(ValueError):
         da.regrid.conservative_2d(
             _rect_target(), x_coord="x", y_coord="y", nan_threshold=1.5
+        )
+
+
+def test_invalid_manifold_raises():
+    da = _rect_da()
+    with pytest.raises(ValueError, match="manifold must be one of"):
+        da.regrid.conservative_2d(
+            _rect_target(), x_coord="x", y_coord="y", manifold="bogus"
         )
 
 
@@ -198,8 +206,10 @@ def test_regridder_weight_cache():
     da = _rect_da()
     target = _rect_target()
     regridder = ConservativeRegridder(da, target, x_coord="x", y_coord="y")
-    assert "forward_weights" not in regridder.__dict__
+    # _forward is a cached_property; not yet materialized before first regrid.
+    assert "_forward" not in regridder.__dict__
     regridder.regrid(da)
+    assert "_forward" in regridder.__dict__
     w1 = regridder.forward_weights
     regridder.regrid(da)
     assert regridder.forward_weights is w1  # same object, not rebuilt
@@ -253,8 +263,8 @@ def test_regridder_shape_mismatch_raises():
         regridder.regrid(smaller)
 
 
-def test_spherical_mode_matches_factored():
-    """Polygon path with ``spherical=True`` should match the axis-factored
+def test_cea_manifold_matches_factored():
+    """Polygon path with ``manifold="cea"`` should match the axis-factored
     sin-weighted conservative path to within a tight tolerance on lat/lon
     grids (both are analytically equivalent for cylindrical equal-area)."""
     lon_s = np.linspace(-180, 180, 180, endpoint=False) + 1.0
@@ -271,7 +281,7 @@ def test_spherical_mode_matches_factored():
 
     factored = da.regrid.conservative(target, latitude_coord="latitude")
     polygon = da.regrid.conservative_2d(
-        target, x_coord="longitude", y_coord="latitude", spherical=True
+        target, x_coord="longitude", y_coord="latitude", manifold="cea"
     )
     # Both methods should agree to the grid's own quadrature accuracy. Near the
     # poles the factored path's median-dlat approximation introduces a small
@@ -284,11 +294,11 @@ def test_spherical_mode_matches_factored():
     )
 
 
-def test_spherical_conserves_integral():
+def test_cea_conserves_integral():
     """Mass conservation check on the sphere. For cos^2(lat), true integral is
     8*pi/3; the regridder on a 2-to-6-degree grid should keep the
     spherical-area-weighted sum within the grid quadrature floor when
-    spherical=True, and miss it by ~17x more when spherical=False."""
+    manifold="cea", and miss it by ~17x more with planar."""
     lon_s = np.linspace(-180, 180, 180, endpoint=False) + 1.0
     lat_s = np.linspace(-90, 90, 90, endpoint=False) + 1.0
     lon_t = np.linspace(-180, 180, 60, endpoint=False) + 3.0
@@ -300,11 +310,11 @@ def test_spherical_conserves_integral():
     )
     target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
 
-    out_sph = da.regrid.conservative_2d(
-        target, x_coord="longitude", y_coord="latitude", spherical=True
+    out_cea = da.regrid.conservative_2d(
+        target, x_coord="longitude", y_coord="latitude", manifold="cea"
     )
-    out_raw = da.regrid.conservative_2d(
-        target, x_coord="longitude", y_coord="latitude", spherical=False
+    out_planar = da.regrid.conservative_2d(
+        target, x_coord="longitude", y_coord="latitude", manifold="planar"
     )
 
     # True target spherical cell areas
@@ -315,12 +325,14 @@ def test_spherical_conserves_integral():
     a_tgt = dlat_bands[:, None] * dlon_arr[None, :]
 
     true_val = 8 * np.pi / 3
-    sph_vals = out_sph.transpose("latitude", "longitude").values
-    raw_vals = out_raw.transpose("latitude", "longitude").values
-    err_sph = abs(float((sph_vals * a_tgt).sum()) - true_val)
-    err_raw = abs(float((raw_vals * a_tgt).sum()) - true_val)
-    # Spherical should be at least 10x more accurate than raw planar here.
-    assert err_sph < 0.1 * err_raw, f"err_sph={err_sph:.2e} err_raw={err_raw:.2e}"
+    cea_vals = out_cea.transpose("latitude", "longitude").values
+    planar_vals = out_planar.transpose("latitude", "longitude").values
+    err_cea = abs(float((cea_vals * a_tgt).sum()) - true_val)
+    err_planar = abs(float((planar_vals * a_tgt).sum()) - true_val)
+    # CEA should be at least 10x more accurate than raw planar here.
+    assert err_cea < 0.1 * err_planar, (
+        f"err_cea={err_cea:.2e} err_planar={err_planar:.2e}"
+    )
 
 
 # --- from_polygons (unstructured mesh) ----------------------------------------
@@ -561,14 +573,10 @@ def test_to_netcdf_roundtrip_structured(tmp_path):
     rgr2 = ConservativeRegridder.from_netcdf(path)
 
     np.testing.assert_array_equal(rgr2.regrid(da).values, out_before)
-    assert rgr2.x_coord == "x"
-    assert rgr2.y_coord == "y"
-    assert rgr2.spherical is False
-    assert rgr2._src_dims == rgr._src_dims
-    assert rgr2._dst_dims == rgr._dst_dims
+    assert rgr2.spec == rgr.spec
 
 
-def test_to_netcdf_preserves_spherical_flag(tmp_path):
+def test_to_netcdf_preserves_manifold(tmp_path):
     lat_s = np.linspace(-90, 90, 30, endpoint=False) + 3
     lon_s = np.linspace(-180, 180, 60, endpoint=False) + 3
     lat_t = np.linspace(-90, 90, 15, endpoint=False) + 6
@@ -581,13 +589,13 @@ def test_to_netcdf_preserves_spherical_flag(tmp_path):
     target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
 
     rgr = ConservativeRegridder(
-        da, target, x_coord="longitude", y_coord="latitude", spherical=True
+        da, target, x_coord="longitude", y_coord="latitude", manifold="cea"
     )
     before = rgr.regrid(da).values
     path = tmp_path / "r.nc"
     rgr.to_netcdf(path)
     rgr2 = ConservativeRegridder.from_netcdf(path)
-    assert rgr2.spherical is True
+    assert rgr2.manifold == "cea"
     np.testing.assert_allclose(rgr2.regrid(da).values, before, atol=1e-15)
 
 
@@ -641,9 +649,9 @@ def test_to_netcdf_metadata_fields(tmp_path):
 
     assert attrs["x_coord"] == "x"
     assert attrs["y_coord"] == "y"
-    assert bool(int(attrs["spherical"])) is False
-    assert tuple(int(size) for size in attrs["src_shape"]) == rgr._src_shape
-    assert tuple(int(size) for size in attrs["dst_shape"]) == rgr._dst_shape
+    assert str(attrs["manifold"]) == "planar"
+    assert tuple(int(size) for size in attrs["src_shape"]) == rgr.spec.src_shape
+    assert tuple(int(size) for size in attrs["dst_shape"]) == rgr.spec.dst_shape
     # Grid ranges captured when the coord is present in source/target.
     assert "source_x_range" in attrs
     assert "target_x_range" in attrs
