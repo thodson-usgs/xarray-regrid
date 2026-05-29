@@ -798,6 +798,12 @@ def _to_csr(weights: "sparse.COO | np.ndarray") -> "sp.csr_matrix":
     return sp.csr_matrix(np.asarray(weights))
 
 
+def _is_rectilinear_pair(xc: xr.DataArray, yc: xr.DataArray) -> bool:
+    """True when x and y are 1D coords on distinct dims (axis-aligned
+    rectangles — the separable fast path); False for curvilinear 2D coords."""
+    return bool(xc.ndim == 1 and yc.ndim == 1 and xc.dims[0] != yc.dims[0])
+
+
 def _spatial_dims(
     obj: xr.DataArray | xr.Dataset, x_coord: str, y_coord: str
 ) -> tuple[Hashable, ...]:
@@ -810,11 +816,11 @@ def _spatial_dims(
     """
     if x_coord not in obj.coords or y_coord not in obj.coords:
         return ()
-    xd = obj[x_coord].dims
-    yd = obj[y_coord].dims
-    if len(xd) == 1 and len(yd) == 1 and xd[0] != yd[0]:
-        return (yd[0], xd[0])
-    dims = set(xd) | set(yd)
+    xc = obj[x_coord]
+    yc = obj[y_coord]
+    if _is_rectilinear_pair(xc, yc):
+        return (yc.dims[0], xc.dims[0])
+    dims = set(xc.dims) | set(yc.dims)
     return tuple(d for d in obj.dims if d in dims)
 
 
@@ -841,7 +847,7 @@ def _build_planar_from_coords(
     array in ``dims`` order."""
     xd = obj[x_coord]
     yd = obj[y_coord]
-    if xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]:
+    if _is_rectilinear_pair(xd, yd):
         return _build_grid(np.asarray(xd.values), np.asarray(yd.values))
     xc, yc = xr.broadcast(xd, yd)
     return _build_grid(
@@ -862,7 +868,7 @@ def _build_cea_from_coords(
     the same cost as the planar fast path. Rectilinear-only."""
     xd = obj[x_coord]
     yd = obj[y_coord]
-    if not (xd.ndim == 1 and yd.ndim == 1 and xd.dims[0] != yd.dims[0]):
+    if not _is_rectilinear_pair(xd, yd):
         msg = 'manifold="cea" is only supported for rectilinear (1D lat/lon) coords'
         raise NotImplementedError(msg)
     return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
@@ -1181,8 +1187,8 @@ def _apply_core(
     # The CSR matmul promotes to float64 (weights are float64) regardless of
     # the input dtype — cast back to the requested output dtype so float32-in
     # really produces float32-out (halves memory for float32 pipelines).
-    if result.dtype != output_dtype:
-        result = result.astype(output_dtype, copy=False)
+    # astype(copy=False) is a no-op when the dtype already matches.
+    result = result.astype(output_dtype, copy=False)
 
     out_shape = (*leading_shape, *dst_shape) if leading_shape else dst_shape
     return result.reshape(out_shape)
@@ -1190,11 +1196,11 @@ def _apply_core(
 
 def _result_dtype(obj: xr.DataArray | xr.Dataset) -> np.dtype:
     if isinstance(obj, xr.DataArray):
-        return np.result_type(np.float32, obj.dtype)
+        return utils.min_weight_dtype(obj.dtype)
     dtypes = [v.dtype for v in obj.data_vars.values()]
     if not dtypes:
         return np.dtype(np.float64)
-    return np.result_type(np.float32, *dtypes)
+    return utils.min_weight_dtype(*dtypes)
 
 
 def _assign_target_coords(

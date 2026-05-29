@@ -143,6 +143,12 @@ def infer_1d_edges(centers: np.ndarray) -> np.ndarray:
     return np.concatenate([[left], mids, [right]])
 
 
+def min_weight_dtype(*dtypes: np.dtype) -> np.dtype:
+    """Regrid-weight dtype policy: single precision at minimum, double if any
+    input is double. Shared by the conservative weight builders."""
+    return np.result_type(np.float32, *dtypes)
+
+
 def to_intervalindex(coords: np.ndarray) -> pd.IntervalIndex:
     """Convert a 1-d coordinate array to a pandas IntervalIndex. Take
     the midpoints between the coordinates as the interval boundaries.
