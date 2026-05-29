@@ -424,16 +424,8 @@ class ConservativeRegridder:
                 dst_polys, reference=_polygon_reference_x(src_polys)
             )
 
-        src_grid = _Grid(
-            polys=src_polys,
-            bounds=shapely.bounds(src_polys),
-            rectilinear=False,
-        )
-        dst_grid = _Grid(
-            polys=dst_polys,
-            bounds=shapely.bounds(dst_polys),
-            rectilinear=False,
-        )
+        src_grid = _Grid(polys=src_polys, bounds=None, rectilinear=False)
+        dst_grid = _Grid(polys=dst_polys, bounds=None, rectilinear=False)
         n_src = int(src_polys.size)
         n_dst = int(dst_polys.size)
         tgt_ds = (
@@ -936,15 +928,17 @@ class _Grid:
     """Cached cell geometry for a structured grid.
 
     ``polys`` is a flat (n_cells,) object array of shapely Polygons.
-    ``bounds`` is a (n_cells, 4) ``(minx, miny, maxx, maxy)`` array cached for
-    the STRtree / candidate-search path. ``rectilinear`` is True when both the
-    source x and y were 1D coordinate arrays (axis-aligned rectangles) — the
-    weight builder uses this to skip GEOS polygon clipping and compute
-    intersection areas analytically from the bounds.
+    ``bounds`` is a (n_cells, 4) ``(minx, miny, maxx, maxy)`` array used only by
+    the rectilinear analytic fast-path. It is ``None`` for non-rectilinear grids,
+    where the area builder reads ``polys`` (via GEOS/STRtree) and never the
+    bounds — so computing them there would be wasted work. ``rectilinear`` is
+    True when both the source x and y were 1D coordinate arrays (axis-aligned
+    rectangles) — the weight builder uses this to skip GEOS polygon clipping and
+    compute intersection areas analytically from the bounds.
     """
 
     polys: np.ndarray
-    bounds: np.ndarray
+    bounds: np.ndarray | None
     rectilinear: bool
 
 
@@ -985,7 +979,7 @@ def _build_grid(xc: np.ndarray, yc: np.ndarray) -> _Grid:
         c01 = np.stack([xcorn[1:, :-1], ycorn[1:, :-1]], axis=-1)
         rings = np.stack([c00, c10, c11, c01, c00], axis=2).reshape(ny * nx, 5, 2)
         polys = shapely.polygons(rings)
-        return _Grid(polys=polys, bounds=shapely.bounds(polys), rectilinear=False)
+        return _Grid(polys=polys, bounds=None, rectilinear=False)
     msg = "x and y coordinate arrays must both be 1D or both 2D"
     raise ValueError(msg)
 
@@ -1030,8 +1024,10 @@ def _build_intersection_areas(
         return _empty_weights(n_dst, n_src)
 
     if src.rectilinear and dst.rectilinear:
-        sb = src.bounds[src_idx]
-        db = dst.bounds[dst_idx]
+        # Rectilinear grids always carry bounds (set in _rect_grid_from_edges);
+        # non-rectilinear grids leave them None and never reach this branch.
+        sb = cast("np.ndarray", src.bounds)[src_idx]
+        db = cast("np.ndarray", dst.bounds)[dst_idx]
         dx = np.minimum(sb[:, 2], db[:, 2]) - np.maximum(sb[:, 0], db[:, 0])
         dy = np.minimum(sb[:, 3], db[:, 3]) - np.maximum(sb[:, 1], db[:, 1])
         areas = np.maximum(dx, 0.0) * np.maximum(dy, 0.0)
