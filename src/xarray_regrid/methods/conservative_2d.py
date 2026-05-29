@@ -294,9 +294,10 @@ class ConservativeRegridder:
         )
 
     def to_netcdf(self, path: str | Path, engine: NetcdfEngine = None) -> None:
-        """Save the weight matrix and reproducibility metadata to a netCDF file.
-        Requires a group-aware engine (``netcdf4`` or ``h5netcdf``); ``engine``
-        is forwarded to :func:`xarray.Dataset.to_netcdf`."""
+        """Save the regridder — its area-intersection matrix (:attr:`areas`)
+        plus reproducibility metadata — to a netCDF file. Requires a
+        group-aware engine (``netcdf4`` or ``h5netcdf``); ``engine`` is
+        forwarded to :func:`xarray.Dataset.to_netcdf`."""
         path = Path(path)
         row, col, data, shape = _coo_components(self.areas)
         ds_weights = xr.Dataset(

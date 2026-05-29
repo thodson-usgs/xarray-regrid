@@ -29,7 +29,7 @@ xarray-regrid: Regridding utilities for xarray
 Overview
 ========
 
-``xarray-regrid`` extends xarray with regridding methods, making it possibly to easily and effiently regrid between two rectilinear grids. 
+``xarray-regrid`` extends xarray with regridding methods, making it easy and efficient to regrid between rectilinear grids — and, with the conservative 2D method, onto curvilinear grids, unstructured meshes, or arbitrary polygons.
 
 The following methods are supported:
 
