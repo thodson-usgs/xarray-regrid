@@ -216,5 +216,5 @@ disallow_any_unimported = false
 warn_return_any = false
 
 [[tool.mypy.overrides]]
-module = ["shapely", "shapely.*", "sparse"]
+module = ["shapely", "shapely.*", "sparse", "scipy", "scipy.*"]
 ignore_missing_imports = true

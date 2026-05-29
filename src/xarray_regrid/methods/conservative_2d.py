@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
+import scipy.sparse as sp
 import xarray as xr
 
 from xarray_regrid import utils
@@ -93,9 +94,8 @@ class _Direction:
     and derives, on first access:
 
     - ``weights``: row-normalized weight matrix
-    - ``apply_matrix``: pre-transposed and index-sorted weights, so
-      ``_apply_core``'s matmul is ``(..., n_src) @ (n_src, n_dst)`` with no
-      per-call sort
+    - ``apply_matrix``: the weights as a scipy CSR matrix, used by
+      ``_apply_core``'s ``(W @ data.T).T`` matmul (see :func:`_to_csr`)
     - ``coverage``: which output cells have any source overlap
 
     A regridder holds two of these (forward, backward); transposing the
@@ -110,8 +110,8 @@ class _Direction:
         return _row_normalize(self.areas)
 
     @cached_property
-    def apply_matrix(self) -> "sparse.COO | np.ndarray":
-        return _transpose_weights(self.weights, sort=True)
+    def apply_matrix(self) -> "sp.csr_matrix":
+        return _to_csr(self.weights)
 
     @cached_property
     def coverage(self) -> np.ndarray:
@@ -494,11 +494,12 @@ def _apply_stored_weights(
     skipna: bool,
     nan_threshold: float,
 ) -> xr.DataArray | xr.Dataset:
-    """Apply ``direction``'s cached, pre-transposed weight matrix to ``data``
-    via ``xr.apply_ufunc``.
+    """Apply ``direction``'s cached weight matrix to ``data`` via
+    ``xr.apply_ufunc``.
 
-    The apply matrix has shape ``(n_src, n_dst)`` so the matmul is
-    ``(..., n_src) @ (n_src, n_dst) → (..., n_dst)`` with no per-call transpose.
+    The apply matrix is a scipy CSR of shape ``(n_dst, n_src)``; ``_apply_core``
+    evaluates ``(W @ flat.T).T`` (CSR · dense), which is markedly faster than a
+    ``sparse.COO`` dense matmul (see :func:`_to_csr`).
     """
     actual_src_shape = tuple(
         int(data.sizes[d]) for d in spec.src_dims if d in data.sizes
@@ -760,28 +761,41 @@ def _axis_index_permuter(
 
 
 def _transpose_weights(
-    w: "sparse.COO | np.ndarray", *, sort: bool = False
+    w: "sparse.COO | np.ndarray",
 ) -> "sparse.COO | np.ndarray":
     """Materialize a transposed weight matrix.
 
-    `sparse.COO.T` is a lazy view that re-sorts indices on each downstream
-    matmul, so callers relying on ``.coords[0]`` being row indices or wanting
-    a hot matmul path should materialize once here. Pass ``sort=True`` to
-    additionally trigger the sort ahead of time (used for the apply matrix).
+    ``sparse.COO.T`` is a lazy view, so callers relying on ``.coords[0]``
+    being row indices (e.g. the backward direction's area matrix) should
+    materialize once here.
     """
     if _HAS_SPARSE and isinstance(w, sparse.COO):
         t = w.T
-        out = sparse.COO(
+        return sparse.COO(
             coords=np.asarray(t.coords),
             data=np.asarray(t.data),
             shape=t.shape,
             has_duplicates=False,
             sorted=False,
         )
-        if sort:
-            out._sort_indices()
-        return out
     return np.asarray(w).T.copy()
+
+
+def _to_csr(weights: "sparse.COO | np.ndarray") -> "sp.csr_matrix":
+    """Convert row-normalized weights to a scipy CSR matrix for the apply path.
+
+    scipy's C SpMM (CSR · dense) is markedly faster than ``sparse.COO @
+    ndarray``, whose numba kernel never converts COO to CSR (unlike sparse's
+    own ``COO @ COO`` and ``GCXS @ ndarray`` paths). scipy is a hard
+    dependency, so this is available regardless of whether ``sparse`` is
+    installed (and also speeds up the dense fallback).
+    """
+    if _HAS_SPARSE and isinstance(weights, sparse.COO):
+        return sp.csr_matrix(
+            (weights.data, (weights.coords[0], weights.coords[1])),
+            shape=weights.shape,
+        )
+    return sp.csr_matrix(np.asarray(weights))
 
 
 def _spatial_dims(
@@ -1120,10 +1134,11 @@ def _apply_core(
     nan_threshold: float,
     output_dtype: np.dtype,
 ) -> np.ndarray:
-    """Apply a pre-transposed weight matrix along the trailing spatial dims.
+    """Apply the CSR weight matrix along the trailing spatial dims.
 
-    ``arr`` has shape ``(..., *src_shape)``; ``apply_weights`` has shape
-    ``(n_src, n_dst)`` — returns ``(..., *dst_shape)``.
+    ``arr`` has shape ``(..., *src_shape)``; ``apply_weights`` is a scipy CSR
+    of shape ``(n_dst, n_src)`` and the matmul is ``(W @ flat.T).T`` —
+    returns ``(..., *dst_shape)``.
 
     ``coverage`` is a boolean ``(n_dst,)`` mask: target cells with any source
     overlap. ``coverage_all`` is precomputed so every block skips the
@@ -1145,14 +1160,14 @@ def _apply_core(
     if has_nan:
         mask = (~nan_mask).astype(flat.dtype)
         filled = np.where(nan_mask, flat.dtype.type(0.0), flat)
-        numerator = np.asarray(filled @ apply_weights)
-        fraction = np.asarray(mask @ apply_weights)
+        numerator = np.asarray((apply_weights @ filled.T).T)
+        fraction = np.asarray((apply_weights @ mask.T).T)
         threshold = get_valid_threshold(nan_threshold)
         with np.errstate(invalid="ignore", divide="ignore"):
             result = numerator / fraction
         valid = fraction >= threshold
     else:
-        result = np.asarray(flat @ apply_weights)
+        result = np.asarray((apply_weights @ flat.T).T)
         valid = None
     # Always mask domain-uncovered cells. With NaNs the uncovered rows already
     # have fraction=0 (so the threshold check below catches them), but ANDing
@@ -1163,9 +1178,9 @@ def _apply_core(
     if valid is not None:
         result = np.where(valid, result, np.nan)
 
-    # sparse.matmul promotes to float64 regardless of the input dtype — cast
-    # back to the requested output dtype so float32-in really produces
-    # float32-out (halves memory for float32 pipelines).
+    # The CSR matmul promotes to float64 (weights are float64) regardless of
+    # the input dtype — cast back to the requested output dtype so float32-in
+    # really produces float32-out (halves memory for float32 pipelines).
     if result.dtype != output_dtype:
         result = result.astype(output_dtype, copy=False)
 
