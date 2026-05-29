@@ -25,8 +25,9 @@ Most notebooks compare the methods implemented in xarray-regrid against more sta
 
 .. toctree::
   :maxdepth: 1
-  :caption: Conservative 2D (curvilinear / unstructured / regions)
+  :caption: Conservative 2D (curvilinear / unstructured / regions / spherical)
 
   demos/demo_conservative_2d_curvilinear.ipynb
   demos/demo_conservative_2d_unstructured.ipynb
   demos/demo_conservative_2d_regions.ipynb
+  demos/demo_conservative_2d_spherical.ipynb

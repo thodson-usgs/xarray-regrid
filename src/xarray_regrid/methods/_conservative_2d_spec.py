@@ -6,8 +6,9 @@ from typing import Literal
 # - "planar": raw shapely on the user's coords
 # - "cea": Lambert cylindrical equal-area projection of 1D lat/lon (degrees)
 #          — analytic spherical areas at planar cost
-# Future backends (e.g. true great-circle "s2") plug in via _GRID_BUILDERS.
-Manifold = Literal["planar", "cea"]
+# - "s2": true great-circle polygons on the sphere via the optional `spherely`
+#         package (s2geometry). Plugs in via _GRID_BUILDERS like the others.
+Manifold = Literal["planar", "cea", "s2"]
 
 
 @dataclass(frozen=True)

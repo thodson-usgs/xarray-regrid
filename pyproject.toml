@@ -54,6 +54,12 @@ conservative-2d = [
   # Needed by ConservativeRegridder.to_netcdf / from_netcdf (group support).
   "h5netcdf",
 ]
+spherical = [
+  # Great-circle (s2) geometry for conservative_2d via spherely (s2geometry).
+  # Builds on conservative-2d.
+  "xarray-regrid[conservative-2d]",
+  "spherely>=0.1.1",
+]
 benchmarking = [
   "matplotlib",
   "zarr",
@@ -205,8 +211,9 @@ warn_unused_ignores = true
 show_error_codes = true
 exclude = ["tests/*", "docs"]
 
-# shapely and sparse are untyped; the conservative_2d module bridges to them,
-# so treating every signature that mentions sparse.COO as an error is noise.
+# shapely, sparse, and spherely are untyped; the conservative_2d module bridges
+# to them, so treating every signature that mentions sparse.COO as an error is
+# noise.
 [[tool.mypy.overrides]]
 module = [
   "xarray_regrid.methods.conservative_2d",
@@ -216,5 +223,5 @@ disallow_any_unimported = false
 warn_return_any = false
 
 [[tool.mypy.overrides]]
-module = ["shapely", "shapely.*", "sparse", "scipy", "scipy.*"]
+module = ["shapely", "shapely.*", "sparse", "scipy", "scipy.*", "spherely"]
 ignore_missing_imports = true

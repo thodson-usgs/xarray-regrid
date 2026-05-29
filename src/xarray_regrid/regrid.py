@@ -120,7 +120,9 @@ class Regridder:
                 shapely polygons in the user's coord space. ``"cea"`` projects
                 1D rectilinear lat/lon (degrees) into Lambert cylindrical
                 equal-area space before intersecting — proper spherical
-                areas at planar cost.
+                areas at planar cost. ``"s2"`` intersects cells as true
+                great-circle polygons on the sphere via the optional
+                ``spherely`` package (s2geometry); rectilinear lat/lon only.
             time_dim: Name of a time coordinate to drop from ``ds_target_grid``
                 before building the regridder (its first step is selected).
                 Source dims other than ``x_coord``/``y_coord`` — including

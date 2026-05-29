@@ -64,6 +64,14 @@ except ImportError:  # pragma: no cover
     sparse = None
     _HAS_SPARSE = False
 
+try:
+    import spherely
+
+    _HAS_SPHERELY = True
+except ImportError:  # pragma: no cover
+    spherely = None
+    _HAS_SPHERELY = False
+
 
 # We fill NaNs with 0 ourselves before matmul (see `_apply_core`), so sparse's
 # "NaN will not be propagated" warning is spurious. A module-level filter
@@ -85,6 +93,18 @@ SHAPELY_IMPORT_ERROR = (
 def _check_shapely() -> None:
     if not _HAS_SHAPELY:
         raise ImportError(SHAPELY_IMPORT_ERROR)
+
+
+SPHERELY_IMPORT_ERROR = (
+    "manifold='s2' requires the optional `spherely` package. "
+    "Install with `pip install spherely` or "
+    "`pip install xarray-regrid[spherical]`."
+)
+
+
+def _check_spherely() -> None:
+    if not _HAS_SPHERELY:
+        raise ImportError(SPHERELY_IMPORT_ERROR)
 
 
 class _Direction:
@@ -473,6 +493,12 @@ def polygons_from_coords(
     projects 1D lat/lon (degrees) into Lambert cylindrical equal-area space;
     ``periodic=True`` unwraps antimeridian-crossing cells."""
     _check_shapely()
+    if manifold == "s2":
+        msg = (
+            "polygons_from_coords supports manifold 'planar' or 'cea'; "
+            "for s2 use ConservativeRegridder(..., manifold='s2') directly."
+        )
+        raise ValueError(msg)
     _check_manifold(manifold)
     x = np.asarray(x)
     y = np.asarray(y)
@@ -874,12 +900,32 @@ def _build_cea_from_coords(
     return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
 
 
+def _build_s2_from_coords(
+    obj: xr.DataArray | xr.Dataset,
+    x_coord: str,
+    y_coord: str,
+    dims: tuple[Hashable, ...],  # noqa: ARG001 — dispatched signature
+) -> "_Grid":
+    """Great-circle cell polygons on the sphere from 1D rectilinear lat/lon
+    centers (degrees), via the optional ``spherely`` package (s2geometry).
+    The returned grid carries spherely Geographies in ``s2_polys`` alongside a
+    planar shapely shadow used only as the STRtree candidate-pair bbox filter.
+    Rectilinear-only."""
+    xd = obj[x_coord]
+    yd = obj[y_coord]
+    if not _is_rectilinear_pair(xd, yd):
+        msg = 'manifold="s2" is only supported for rectilinear (1D lat/lon) coords'
+        raise NotImplementedError(msg)
+    return _build_s2_grid(np.asarray(xd.values), np.asarray(yd.values))
+
+
 # Registry of geometry backends. Each builder takes the same
 # ``(obj, x_coord, y_coord, dims)`` and returns a ``_Grid``. New manifolds
-# (e.g. true great-circle ``"s2"``) plug in via a single insert.
+# plug in via a single insert.
 _GRID_BUILDERS: dict[str, Callable[..., "_Grid"]] = {
     "planar": _build_planar_from_coords,
     "cea": _build_cea_from_coords,
+    "s2": _build_s2_from_coords,
 }
 
 
@@ -888,6 +934,8 @@ def _check_manifold(manifold: str) -> None:
         valid = ", ".join(repr(m) for m in sorted(_GRID_BUILDERS))
         msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
         raise ValueError(msg)
+    if manifold == "s2":
+        _check_spherely()
 
 
 def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
@@ -909,6 +957,63 @@ def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid"
         np.deg2rad(lon_edges_deg),
         np.sin(np.deg2rad(lat_edges_deg)),
     )
+
+
+def _build_s2_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
+    """Rectilinear _Grid carrying spherely great-circle cell polygons in
+    ``s2_polys`` (plus planar shapely polys/bounds, used only as the STRtree
+    candidate-pair bbox filter since spherely has no spatial index)."""
+    _check_shapely()
+    _check_spherely()
+    if lon_centers.size < 2 or lat_centers.size < 2:
+        msg = 'manifold="s2" requires at least two cells per dimension'
+        raise ValueError(msg)
+    lon_edges_deg = utils.infer_1d_edges(lon_centers)
+    lat_edges_deg = np.clip(utils.infer_1d_edges(lat_centers), -90.0, 90.0)
+    planar = _rect_grid_from_edges(lon_edges_deg, lat_edges_deg)
+    return _Grid(
+        polys=planar.polys,
+        bounds=planar.bounds,
+        rectilinear=True,
+        s2_polys=_s2_cell_polys(lon_edges_deg, lat_edges_deg),
+    )
+
+
+def _s2_cell_polys(lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray) -> np.ndarray:
+    """Build an (n_cells,) object array of spherely.Geography polygons.
+
+    Each polygon uses explicit CCW vertex order in (lon, lat) degrees and
+    ``oriented=True`` so orientation is unambiguous for cells that touch the
+    poles or span wide longitude ranges.
+    """
+    if hasattr(spherely, "polygons"):
+        # Vectorized constructor (benbovy/spherely#52, not yet released). When
+        # it lands we build shells as (n, 4, 2) and skip the Python loop.
+        x0, y0 = np.meshgrid(lon_edges_deg[:-1], lat_edges_deg[:-1], indexing="xy")
+        x1, y1 = np.meshgrid(lon_edges_deg[1:], lat_edges_deg[1:], indexing="xy")
+        shells = np.stack(
+            [
+                np.stack([x0, y0], axis=-1),
+                np.stack([x1, y0], axis=-1),
+                np.stack([x1, y1], axis=-1),
+                np.stack([x0, y1], axis=-1),
+            ],
+            axis=-2,
+        ).reshape(-1, 4, 2)
+        return np.asarray(spherely.polygons(shells, oriented=True))
+    # Per-cell fallback: `spherely.create_polygon` wants an iterable of tuples,
+    # and a Python loop over pre-slicing an ndarray is slower than building
+    # the tuple list inline.
+    nx = lon_edges_deg.size - 1
+    ny = lat_edges_deg.size - 1
+    polys = np.empty(ny * nx, dtype=object)
+    for j in range(ny):
+        y0f, y1f = float(lat_edges_deg[j]), float(lat_edges_deg[j + 1])
+        for i in range(nx):
+            x0f, x1f = float(lon_edges_deg[i]), float(lon_edges_deg[i + 1])
+            shell = [(x0f, y0f), (x1f, y0f), (x1f, y1f), (x0f, y1f)]
+            polys[j * nx + i] = spherely.create_polygon(shell, oriented=True)
+    return polys
 
 
 def _infer_2d_corners(a: np.ndarray) -> np.ndarray:
@@ -940,11 +1045,20 @@ class _Grid:
     source x and y were 1D coordinate arrays (axis-aligned rectangles) — the
     weight builder uses this to skip GEOS polygon clipping and compute
     intersection areas analytically from the bounds.
+
+    ``s2_polys`` is an optional (n_cells,) object array of spherely Geography
+    polygons (great-circle cells on the sphere). It is ``None`` for the planar
+    and cea manifolds; for ``manifold="s2"`` it carries the spherely cells
+    while ``polys``/``bounds`` hold the planar shadow used only as the STRtree
+    candidate-pair bbox filter. When both the source and target grids carry
+    ``s2_polys`` the weight builder uses spherely great-circle intersection
+    instead of the planar/analytic paths.
     """
 
     polys: np.ndarray
     bounds: np.ndarray
     rectilinear: bool
+    s2_polys: np.ndarray | None = None
 
 
 def _rect_grid_from_edges(xe: np.ndarray, ye: np.ndarray) -> _Grid:
@@ -1002,8 +1116,15 @@ def _build_intersection_areas(
     This is the unnormalized matrix. Row-normalize via :func:`_row_normalize`
     to get forward weights; transpose first for backward (target → source).
 
-    When both grids are rectilinear (axis-aligned rectangles) intersection
-    areas are computed analytically from the bounds, skipping GEOS clipping.
+    The candidate ``(dst, src)`` cell pairs always come from a planar STRtree
+    query on ``.polys``/``.bounds`` (spherely has no spatial index), but the
+    areas themselves are computed by one of three dispatch paths:
+
+      1. both grids carry ``s2_polys`` → great-circle areas in steradians via
+         :func:`_s2_intersection_areas` (``spherely`` on the unit sphere);
+      2. else both grids rectilinear → analytic axis-aligned box-overlap from
+         the bounds, skipping GEOS clipping;
+      3. else → GEOS polygon intersection via :func:`_intersection_areas_threaded`.
 
     ``predicate_filter=False`` (default) uses a bbox-only STRtree query and
     relies on the ``area > 0`` filter below to drop bbox-false-positives.
@@ -1028,7 +1149,11 @@ def _build_intersection_areas(
     if dst_idx.size == 0:
         return _empty_weights(n_dst, n_src)
 
-    if src.rectilinear and dst.rectilinear:
+    if src.s2_polys is not None and dst.s2_polys is not None:
+        areas = _s2_intersection_areas(
+            dst.s2_polys[dst_idx], src.s2_polys[src_idx], n_threads=n_threads
+        )
+    elif src.rectilinear and dst.rectilinear:
         sb = src.bounds[src_idx]
         db = dst.bounds[dst_idx]
         dx = np.minimum(sb[:, 2], db[:, 2]) - np.maximum(sb[:, 0], db[:, 0])
@@ -1097,6 +1222,46 @@ def _intersection_areas_threaded(
 
     def _work(idx: np.ndarray) -> np.ndarray:
         return shapely.area(shapely.intersection(a[idx], b[idx]))
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        parts = list(pool.map(_work, splits))
+    return np.concatenate(parts)
+
+
+def _s2_intersection_areas(
+    dst_geog: np.ndarray,
+    src_geog: np.ndarray,
+    n_threads: int | None = None,
+) -> np.ndarray:
+    """Per-pair great-circle intersection areas in steradians.
+
+    ``spherely.intersection`` and ``spherely.area`` are both vectorized ufuncs
+    so the serial path is a single pass through each. ``radius=1.0`` gives the
+    result on the unit sphere — fine for row-normalized weights because the
+    Earth radius would cancel through the normalization anyway.
+
+    Spherely releases the GIL during the s2 boolean op (on versions that ship
+    the gil_scoped_release patch), so chunking the pair array across a
+    ThreadPoolExecutor parallelises the heavy intersection step at near-
+    linear scaling up to ~4 cores. Falls back to serial on older spherely,
+    or when ``n_threads<=1`` or the workload is too small to amortise the
+    pool overhead.
+    """
+    _check_spherely()
+    n = len(dst_geog)
+    if n_threads is None:
+        n_threads = min(os.cpu_count() or 1, 4)
+        if n < 50_000:
+            n_threads = 1
+    if n_threads <= 1 or n == 0:
+        inter = spherely.intersection(dst_geog, src_geog)
+        return np.asarray(spherely.area(inter, radius=1.0))
+
+    splits = np.array_split(np.arange(n), n_threads)
+
+    def _work(idx: np.ndarray) -> np.ndarray:
+        inter = spherely.intersection(dst_geog[idx], src_geog[idx])
+        return np.asarray(spherely.area(inter, radius=1.0))
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         parts = list(pool.map(_work, splits))

@@ -699,3 +699,99 @@ def test_regridder_transpose_curvilinear():
     assert "y" in back.dims and "x" in back.dims
     assert back.sizes["y"] == da.sizes["y"]
     assert back.sizes["x"] == da.sizes["x"]
+
+
+# --- s2 manifold (optional, requires spherely) --------------------------------
+
+spherely = pytest.importorskip("spherely", reason="s2 manifold tests require spherely")
+
+
+def _latlon_da(ny=24, nx=36, lat_max=87.5, lon_max=175, fill=None, seed=0):
+    lat = np.linspace(-lat_max, lat_max, ny)
+    lon = np.linspace(-lon_max, lon_max, nx)
+    if fill is None:
+        vals = np.random.default_rng(seed).normal(size=(ny, nx))
+    else:
+        vals = np.full((ny, nx), fill)
+    return xr.DataArray(
+        vals,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat, "longitude": lon},
+    )
+
+
+def _latlon_target(ny=9, nx=18, lat_max=80, lon_max=170):
+    return xr.Dataset(
+        coords={
+            "latitude": np.linspace(-lat_max, lat_max, ny),
+            "longitude": np.linspace(-lon_max, lon_max, nx),
+        }
+    )
+
+
+def _s2_regridder(da, target):
+    return ConservativeRegridder(
+        da, target, x_coord="longitude", y_coord="latitude", manifold="s2"
+    )
+
+
+def test_s2_manifold_conserves_mass():
+    """On s2 the raw area matrix rows sum to the target-cell steradians, so
+    `out · a_dst` equals `A · s` to machine precision for any source field."""
+    da = _latlon_da(ny=36, nx=48)
+    target = _latlon_target()
+    rgr = _s2_regridder(da, target)
+    out = rgr.regrid(da).values
+    areas = rgr.areas
+    src_covered = np.ravel(areas.sum(axis=0).todense())
+    dst_covered = np.ravel(areas.sum(axis=1).todense())
+
+    direct_mass = float((da.values.ravel() * src_covered).sum())
+    valid = np.isfinite(out).ravel()
+    out_mass = float((out.ravel()[valid] * dst_covered[valid]).sum())
+    rel = abs(direct_mass - out_mass) / max(abs(direct_mass), 1e-12)
+    assert rel < 1e-12, f"rel err {rel:.2e}"
+
+
+def test_s2_preserves_constant_field():
+    """Roundtrip of a constant field through the s2 path reproduces the
+    constant to machine precision."""
+    da = _latlon_da(fill=7.3)
+    rgr = _s2_regridder(da, _latlon_target())
+    out = rgr.regrid(da).values
+    finite = np.isfinite(out)
+    np.testing.assert_allclose(out[finite], 7.3, atol=1e-12)
+
+
+def test_s2_netcdf_roundtrip(tmp_path):
+    """A saved s2 regridder reloads back to an s2 regridder and produces
+    identical output."""
+    da = _latlon_da(seed=1)
+    rgr = _s2_regridder(da, _latlon_target())
+    before = rgr.regrid(da).values
+    path = tmp_path / "s2.nc"
+    rgr.to_netcdf(path)
+    rgr2 = ConservativeRegridder.from_netcdf(path)
+    assert rgr2.manifold == "s2"
+    np.testing.assert_array_equal(rgr2.regrid(da).values, before)
+
+
+def test_s2_handles_pole_touching_cells():
+    """A global grid whose outer rows touch ±90° exercises the `oriented=True`
+    branch of `spherely.create_polygon` — without an explicit orientation, s2
+    would silently pick the complementary (hemisphere-sized) interpretation
+    of a near-pole cell."""
+    lat = np.linspace(-89.5, 89.5, 24)  # outer edges land exactly on ±90°
+    lon = np.linspace(-175, 175, 36)
+    vals = (np.cos(np.deg2rad(lat)) ** 2)[:, None] * np.ones(lon.size)[None, :]
+    da = xr.DataArray(
+        vals,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat, "longitude": lon},
+    )
+    rgr = _s2_regridder(da, _latlon_target(ny=12, nx=24, lat_max=85))
+    out = rgr.regrid(da).values
+    # Output values should stay in [0, 1] (the source range), not hemispheres.
+    finite = np.isfinite(out)
+    assert np.all(out[finite] >= -1e-12)
+    assert np.all(out[finite] <= 1.0 + 1e-12)
