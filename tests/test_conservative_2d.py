@@ -751,22 +751,58 @@ def _s2_regridder(da, target):
 
 
 @needs_spherely
-def test_s2_manifold_conserves_mass():
-    """On s2 the raw area matrix rows sum to the target-cell steradians, so
-    `out · a_dst` equals `A · s` to machine precision for any source field."""
-    da = _latlon_da(ny=36, nx=48)
-    target = _latlon_target()
-    rgr = _s2_regridder(da, target)
-    out = rgr.regrid(da).values
-    areas = rgr.areas
-    src_covered = np.ravel(areas.sum(axis=0).todense())
-    dst_covered = np.ravel(areas.sum(axis=1).todense())
+def test_s2_conserves_known_integral():
+    """Gold-standard conservation: a field with a KNOWN spherical integral
+    (cos^2(lat) * (1.5 + sin(lon)) integrates to 4*pi over the sphere) regridded
+    with manifold="s2" onto a co-extensive global grid must conserve mass to
+    machine precision when measured with INDEPENDENT great-circle cell areas
+    (spherely.area) — not the regridder's own matrix.
 
-    direct_mass = float((da.values.ravel() * src_covered).sum())
-    valid = np.isfinite(out).ravel()
-    out_mass = float((out.ravel()[valid] * dst_covered[valid]).sum())
-    rel = abs(direct_mass - out_mass) / max(abs(direct_mass), 1e-12)
-    assert rel < 1e-12, f"rel err {rel:.2e}"
+    This is the non-tautological form. A self-area check (row/col sums of
+    rgr.areas) is an algebraic identity that "conserves" *any* matrix, and a
+    constant field conserves under row-normalization even with dropped/wrong
+    overlaps. A spatially-varying field + independent areas + matched domains is
+    what actually exercises the geometry. (The all-pairs coverage tests pin the
+    candidate search locally; this pins the whole pipeline globally, against a
+    known analytic value.)
+    """
+
+    def glat(n):
+        return np.linspace(-90, 90, n, endpoint=False) + 90 / n  # edges hit ±90
+
+    def glon(n):
+        return np.linspace(-180, 180, n, endpoint=False) + 180 / n
+
+    def s2_cell_areas(lon, lat):  # INDEPENDENT areas, not from the regridder
+        grid = _build_s2_grid(np.asarray(lon), np.asarray(lat))
+        return np.asarray(spherely.area(grid.s2_polys, radius=1.0)).reshape(
+            lat.size, lon.size
+        )
+
+    lat_s, lon_s = glat(120), glon(240)
+    lat_t, lon_t = glat(40), glon(80)
+    grid_lat, grid_lon = np.meshgrid(lat_s, lon_s, indexing="ij")
+    field = np.cos(np.deg2rad(grid_lat)) ** 2 * (1.5 + np.sin(np.deg2rad(grid_lon)))
+    da = xr.DataArray(
+        field,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat_s, "longitude": lon_s},
+    )
+    target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
+
+    out = (
+        ConservativeRegridder(
+            da, target, x_coord="longitude", y_coord="latitude", manifold="s2"
+        )
+        .regrid(da)
+        .values
+    )
+    assert np.isfinite(out).all()  # co-extensive global grids -> full coverage
+
+    i_src = float((da.values * s2_cell_areas(lon_s, lat_s)).sum())
+    i_tgt = float((out * s2_cell_areas(lon_t, lat_t)).sum())
+    np.testing.assert_allclose(i_tgt, i_src, rtol=1e-9)  # conserved (machine prec.)
+    np.testing.assert_allclose(i_src, 4 * np.pi, rtol=2e-3)  # ~ the known value
 
 
 @needs_spherely

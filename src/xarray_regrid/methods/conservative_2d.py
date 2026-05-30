@@ -445,16 +445,8 @@ class ConservativeRegridder:
                 dst_polys, reference=_polygon_reference_x(src_polys)
             )
 
-        src_grid = _Grid(
-            polys=src_polys,
-            bounds=shapely.bounds(src_polys),
-            rectilinear=False,
-        )
-        dst_grid = _Grid(
-            polys=dst_polys,
-            bounds=shapely.bounds(dst_polys),
-            rectilinear=False,
-        )
+        src_grid = _PLANAR.grid_from_polygons(src_polys)
+        dst_grid = _PLANAR.grid_from_polygons(dst_polys)
         n_src = int(src_polys.size)
         n_dst = int(dst_polys.size)
         tgt_ds = (
@@ -463,7 +455,7 @@ class ConservativeRegridder:
             else xr.Dataset(coords={target_dim: np.arange(n_dst)})
         )
         return cls._from_state(
-            areas=_BACKENDS["planar"].area_matrix(
+            areas=_PLANAR.area_matrix(
                 src_grid,
                 dst_grid,
                 n_threads=n_threads,
@@ -495,15 +487,12 @@ def polygons_from_coords(
     projects 1D lat/lon (degrees) into Lambert cylindrical equal-area space;
     ``periodic=True`` unwraps antimeridian-crossing cells."""
     _check_shapely()
-    if manifold not in _BACKENDS:
-        valid = ", ".join(repr(m) for m in sorted(_BACKENDS))
-        msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
-        raise ValueError(msg)
+    backend = _resolve_manifold(manifold)
     x = np.asarray(x)
     y = np.asarray(y)
     if periodic:
         x = _unwrap_longitude(x)
-    return _BACKENDS[manifold].polys_from_arrays(x, y)
+    return backend.polys_from_arrays(x, y)
 
 
 def _apply_stored_weights(
@@ -877,15 +866,11 @@ class GeometryBackend(ABC):
 
     @abstractmethod
     def area_matrix(
-        self,
-        src: "_Grid",
-        dst: "_Grid",
-        n_threads: int | None = None,
-        *,
-        predicate_filter: bool = False,
+        self, src: "_Grid", dst: "_Grid", n_threads: int | None = None
     ) -> "sparse.COO | np.ndarray":
         """Unnormalized ``(n_dst, n_src)`` area-intersection matrix
-        ``A[i, j] = area(dst_i ∩ src_j)``."""
+        ``A[i, j] = area(dst_i ∩ src_j)``. (``predicate_filter`` is a
+        planar-only candidate-search knob widened in by :class:`PlanarBackend`.)"""
 
 
 class PlanarBackend(GeometryBackend):
@@ -915,6 +900,12 @@ class PlanarBackend(GeometryBackend):
 
     def polys_from_arrays(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         return _build_grid(x, y).polys
+
+    @staticmethod
+    def grid_from_polygons(polys: np.ndarray) -> "_Grid":
+        """Non-rectilinear _Grid from explicit shapely cell polygons (the
+        ``from_polygons`` path), keeping all planar _Grid construction here."""
+        return _Grid(polys=polys, bounds=shapely.bounds(polys), rectilinear=False)
 
     def area_matrix(
         self,
@@ -1003,12 +994,7 @@ class S2Backend(GeometryBackend):
         raise ValueError(msg)
 
     def area_matrix(
-        self,
-        src: "_Grid",
-        dst: "_Grid",
-        n_threads: int | None = None,
-        *,
-        predicate_filter: bool = False,  # noqa: ARG002 — s2 uses its own search
+        self, src: "_Grid", dst: "_Grid", n_threads: int | None = None
     ) -> "sparse.COO | np.ndarray":
         s2_src = cast("np.ndarray", src.s2_polys)
         s2_dst = cast("np.ndarray", dst.s2_polys)
@@ -1024,12 +1010,17 @@ class S2Backend(GeometryBackend):
 
     @staticmethod
     def _candidate_pairs(src: "_Grid", dst: "_Grid") -> tuple[np.ndarray, np.ndarray]:
-        """Candidate (dst, src) pairs from the bulge-faithful planar shadow,
-        querying the dst boxes shifted by 0 / ±360° in longitude so cells
-        adjacent across the antimeridian are paired — spherely then computes
-        their true great-circle overlap (and the ``area > 0`` filter drops the
-        rest). With the faithful shadow already bounding each cell's poleward
-        bulge, this candidate set is a conservative superset on the sphere."""
+        """Candidate (dst, src) pairs from the bulge-faithful planar shadow.
+
+        Input coordinates are already convention-reconciled and antimeridian-
+        unwrapped by :func:`_normalize_longitude_coords` (in ``__init__``); this
+        loop solves a different, s2-only problem: the *planar shadow's* STRtree
+        can't see that two cells on opposite sides of ±180° genuinely overlap on
+        the sphere. Querying the dst boxes shifted by 0 / ±360° in longitude
+        recovers those seam pairs — spherely then computes their true
+        great-circle overlap (and the ``area > 0`` filter drops the rest). With
+        the faithful shadow already bounding each cell's poleward bulge, the
+        candidate set is a conservative superset on the sphere."""
         _check_shapely()
         tree = STRtree(np.asarray(src.polys))
         db = dst.bounds
@@ -1055,17 +1046,26 @@ class S2Backend(GeometryBackend):
 
 # Manifold registry. Each backend owns its grid construction, candidate-pair
 # search, and intersection kernel; new manifolds plug in via a single insert.
+# ``_PLANAR`` is also held concretely — ``from_polygons`` uses it directly so its
+# planar-only ``grid_from_polygons`` / ``predicate_filter`` are statically visible.
+_PLANAR = PlanarBackend()
 _BACKENDS: dict[str, GeometryBackend] = {
-    b.name: b for b in (PlanarBackend(), CeaBackend(), S2Backend())
+    b.name: b for b in (_PLANAR, CeaBackend(), S2Backend())
 }
 
 
-def _check_manifold(manifold: str) -> None:
+def _resolve_manifold(manifold: str) -> GeometryBackend:
+    """Look up the backend for ``manifold``, raising a clear error on an unknown
+    name (one source of truth for the message)."""
     if manifold not in _BACKENDS:
         valid = ", ".join(repr(m) for m in sorted(_BACKENDS))
         msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
         raise ValueError(msg)
-    _BACKENDS[manifold].check_deps()
+    return _BACKENDS[manifold]
+
+
+def _check_manifold(manifold: str) -> None:
+    _resolve_manifold(manifold).check_deps()
 
 
 def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
@@ -1168,7 +1168,7 @@ def _s2_cell_polys(lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray) -> np.n
     xhi = np.maximum(lon_edges_deg[:-1], lon_edges_deg[1:])
     ylo = np.minimum(lat_edges_deg[:-1], lat_edges_deg[1:])
     yhi = np.maximum(lat_edges_deg[:-1], lat_edges_deg[1:])
-    if hasattr(spherely, "polygons"):
+    if hasattr(spherely, "polygons"):  # pragma: no cover — unreleased spherely#52
         # Vectorized constructor (benbovy/spherely#52, not yet released). When
         # it lands we build shells as (n, 4, 2) and skip the Python loop.
         x0, y0 = np.meshgrid(xlo, ylo, indexing="xy")
@@ -1361,72 +1361,71 @@ def _row_normalize(
     return areas / row_sum
 
 
+def _threaded_pairwise(
+    a: np.ndarray,
+    b: np.ndarray,
+    kernel: "Callable[[np.ndarray, np.ndarray], np.ndarray]",
+    *,
+    n_threads: int | None,
+    serial_below: int,
+    max_threads: int,
+) -> np.ndarray:
+    """Apply a vectorized pairwise ``kernel(a, b) -> areas`` over numpy arrays of
+    geometries, chunked across a ``ThreadPoolExecutor`` when worthwhile.
+
+    Both GEOS (shapely) and s2 (spherely) release the GIL during the boolean op,
+    so threading scales near-linearly without pickling. Serial below
+    ``serial_below`` pairs (pool spin-up dominates) or when ``n_threads <= 1``;
+    ``None`` auto-selects ``min(cpu_count, max_threads)``.
+    """
+    n = len(a)
+    if n_threads is None:
+        n_threads = 1 if n < serial_below else min(os.cpu_count() or 1, max_threads)
+    if n_threads <= 1 or n == 0:
+        return kernel(a, b)
+
+    splits = np.array_split(np.arange(n), n_threads)
+
+    def _work(idx: np.ndarray) -> np.ndarray:
+        return kernel(a[idx], b[idx])
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        parts = list(pool.map(_work, splits))
+    return np.concatenate(parts)
+
+
 def _intersection_areas_threaded(
     a: np.ndarray, b: np.ndarray, n_threads: int | None
 ) -> np.ndarray:
-    """Compute per-pair intersection areas ``area(a[i] & b[i])`` over numpy
-    arrays of shapely geometries, optionally parallelized via threads.
-
-    Shapely 2.x releases the GIL for GEOS ops, so a ``ThreadPoolExecutor``
-    gives near-linear speedup on multi-core machines without pickling data.
-    """
+    """Per-pair planar intersection areas over shapely geometries (GEOS)."""
     _check_shapely()
-    n = len(a)
-    if n_threads is None:
-        # Below ~1k pairs the pool spin-up (~0.3 ms) dominates sub-ms work.
-        # Above that, scaling is near-linear with logical cores — shapely
-        # releases the GIL inside its GEOS ufuncs. Cap at 16 to avoid
-        # oversubscription on unusually wide machines.
-        n_threads = 1 if n < 1_000 else min(os.cpu_count() or 1, 16)
-    if n_threads <= 1 or n == 0:
-        return shapely.area(shapely.intersection(a, b))
-
-    splits = np.array_split(np.arange(n), n_threads)
-
-    def _work(idx: np.ndarray) -> np.ndarray:
-        return shapely.area(shapely.intersection(a[idx], b[idx]))
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        parts = list(pool.map(_work, splits))
-    return np.concatenate(parts)
+    return _threaded_pairwise(
+        a,
+        b,
+        lambda x, y: shapely.area(shapely.intersection(x, y)),
+        n_threads=n_threads,
+        serial_below=1_000,
+        max_threads=16,
+    )
 
 
 def _s2_intersection_areas(
-    dst_geog: np.ndarray,
-    src_geog: np.ndarray,
-    n_threads: int | None = None,
+    dst_geog: np.ndarray, src_geog: np.ndarray, n_threads: int | None = None
 ) -> np.ndarray:
-    """Per-pair great-circle intersection areas in steradians.
+    """Per-pair great-circle intersection areas in steradians (spherely).
 
-    ``spherely.intersection`` and ``spherely.area`` are vectorized ufuncs, so
-    each path is a single pass. ``radius=1.0`` gives areas on the unit sphere —
-    fine for row-normalized weights, where the Earth radius cancels out.
-
-    Above ~50k candidate pairs the work is chunked across a ThreadPoolExecutor.
-    Recent spherely releases the GIL inside the s2 boolean op, so this scales to
-    ~4 cores; on a build that does not release the GIL it still runs correctly,
-    just without the speedup (the spherely version is not detected). Serial when
-    ``n_threads <= 1`` or the workload is small.
+    ``radius=1.0`` gives areas on the unit sphere — fine for row-normalized
+    weights, where the Earth radius cancels out.
     """
     _check_spherely()
-    n = len(dst_geog)
-    if n_threads is None:
-        n_threads = min(os.cpu_count() or 1, 4)
-        if n < 50_000:
-            n_threads = 1
-    if n_threads <= 1 or n == 0:
-        inter = spherely.intersection(dst_geog, src_geog)
-        return np.asarray(spherely.area(inter, radius=1.0))
-
-    splits = np.array_split(np.arange(n), n_threads)
-
-    def _work(idx: np.ndarray) -> np.ndarray:
-        inter = spherely.intersection(dst_geog[idx], src_geog[idx])
-        return np.asarray(spherely.area(inter, radius=1.0))
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        parts = list(pool.map(_work, splits))
-    return np.concatenate(parts)
+    return _threaded_pairwise(
+        dst_geog,
+        src_geog,
+        lambda x, y: np.asarray(spherely.area(spherely.intersection(x, y), radius=1.0)),
+        n_threads=n_threads,
+        serial_below=50_000,
+        max_threads=4,
+    )
 
 
 def _empty_weights(n_dst: int, n_src: int) -> "sparse.COO | np.ndarray":
