@@ -335,6 +335,59 @@ def test_cea_conserves_integral():
     )
 
 
+def test_cea_conserves_known_integral():
+    """Gold-standard conservation: cos^2(lat) * (1.5 + sin(lon)) integrates to
+    4*pi over the sphere. Regridded with manifold="cea" onto a co-extensive
+    global grid, mass is conserved to machine precision when measured with
+    INDEPENDENT analytic spherical cell areas (sin-latitude bands times dlon) —
+    not the regridder's own matrix — and the source integral approaches the
+    known value.
+
+    Unlike a self-area check (a row-normalization identity that "conserves" any
+    matrix) or a constant field (which row-normalization reproduces regardless),
+    a spatially-varying field + independent areas + matched domains actually
+    exercises the geometry. cea cells ARE the sin-projected parallel-bounded
+    cells, so the analytic area is exact and conservation is machine-precise.
+    """
+
+    def glat(n):
+        return np.linspace(-90, 90, n, endpoint=False) + 90 / n  # edges hit ±90
+
+    def glon(n):
+        return np.linspace(-180, 180, n, endpoint=False) + 180 / n
+
+    def analytic_area(n_lon, n_lat):  # independent of the regridder
+        lat_e = np.deg2rad(np.linspace(-90, 90, n_lat + 1))
+        lon_e = np.deg2rad(np.linspace(-180, 180, n_lon + 1))
+        return np.diff(np.sin(lat_e))[:, None] * np.diff(lon_e)[None, :]
+
+    ns_lat, ns_lon, nt_lat, nt_lon = 120, 240, 40, 80
+    lat_s, lon_s = glat(ns_lat), glon(ns_lon)
+    lat_t, lon_t = glat(nt_lat), glon(nt_lon)
+    grid_lat, grid_lon = np.meshgrid(lat_s, lon_s, indexing="ij")
+    field = np.cos(np.deg2rad(grid_lat)) ** 2 * (1.5 + np.sin(np.deg2rad(grid_lon)))
+    da = xr.DataArray(
+        field,
+        dims=("latitude", "longitude"),
+        coords={"latitude": lat_s, "longitude": lon_s},
+    )
+    target = xr.Dataset(coords={"latitude": lat_t, "longitude": lon_t})
+
+    out = (
+        da.regrid.conservative_2d(
+            target, x_coord="longitude", y_coord="latitude", manifold="cea"
+        )
+        .transpose("latitude", "longitude")
+        .values
+    )
+    assert np.isfinite(out).all()  # co-extensive global grids -> full coverage
+
+    i_src = float((da.values * analytic_area(ns_lon, ns_lat)).sum())
+    i_tgt = float((out * analytic_area(nt_lon, nt_lat)).sum())
+    np.testing.assert_allclose(i_tgt, i_src, rtol=1e-12)  # conserved (machine prec.)
+    np.testing.assert_allclose(i_src, 4 * np.pi, rtol=2e-3)  # ~ the known value
+
+
 # --- from_polygons (unstructured mesh) ----------------------------------------
 
 
