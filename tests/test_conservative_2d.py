@@ -6,6 +6,7 @@ import xarray as xr
 
 import xarray_regrid  # noqa: F401  (registers the accessor)
 from xarray_regrid import ConservativeRegridder, polygons_from_coords
+from xarray_regrid.methods.conservative_2d import _build_s2_grid
 
 shapely = pytest.importorskip("shapely")
 
@@ -703,7 +704,21 @@ def test_regridder_transpose_curvilinear():
 
 # --- s2 manifold (optional, requires spherely) --------------------------------
 
-spherely = pytest.importorskip("spherely", reason="s2 manifold tests require spherely")
+# NB: a MODULE-level importorskip would skip this whole file (incl. the 35
+# planar/cea/polygon tests above) when spherely is absent — which is the
+# default CI env, since spherely lives only in the `spherical` extra. Gate just
+# the s2 tests with a per-test marker instead.
+try:
+    import spherely
+
+    _HAS_SPHERELY = True
+except ImportError:  # pragma: no cover
+    spherely = None
+    _HAS_SPHERELY = False
+
+needs_spherely = pytest.mark.skipif(
+    not _HAS_SPHERELY, reason="s2 manifold tests require spherely"
+)
 
 
 def _latlon_da(ny=24, nx=36, lat_max=87.5, lon_max=175, fill=None, seed=0):
@@ -735,6 +750,7 @@ def _s2_regridder(da, target):
     )
 
 
+@needs_spherely
 def test_s2_manifold_conserves_mass():
     """On s2 the raw area matrix rows sum to the target-cell steradians, so
     `out · a_dst` equals `A · s` to machine precision for any source field."""
@@ -753,6 +769,7 @@ def test_s2_manifold_conserves_mass():
     assert rel < 1e-12, f"rel err {rel:.2e}"
 
 
+@needs_spherely
 def test_s2_preserves_constant_field():
     """Roundtrip of a constant field through the s2 path reproduces the
     constant to machine precision."""
@@ -763,6 +780,7 @@ def test_s2_preserves_constant_field():
     np.testing.assert_allclose(out[finite], 7.3, atol=1e-12)
 
 
+@needs_spherely
 def test_s2_netcdf_roundtrip(tmp_path):
     """A saved s2 regridder reloads back to an s2 regridder and produces
     identical output."""
@@ -776,12 +794,13 @@ def test_s2_netcdf_roundtrip(tmp_path):
     np.testing.assert_array_equal(rgr2.regrid(da).values, before)
 
 
+@needs_spherely
 def test_s2_handles_pole_touching_cells():
-    """A global grid whose outer rows touch ±90° exercises the `oriented=True`
+    """A global grid whose outer rows reach ±90° exercises the `oriented=True`
     branch of `spherely.create_polygon` — without an explicit orientation, s2
     would silently pick the complementary (hemisphere-sized) interpretation
     of a near-pole cell."""
-    lat = np.linspace(-89.5, 89.5, 24)  # outer edges land exactly on ±90°
+    lat = np.linspace(-89.5, 89.5, 24)  # inferred outer edges clip to ±90°
     lon = np.linspace(-175, 175, 36)
     vals = (np.cos(np.deg2rad(lat)) ** 2)[:, None] * np.ones(lon.size)[None, :]
     da = xr.DataArray(
@@ -795,3 +814,38 @@ def test_s2_handles_pole_touching_cells():
     finite = np.isfinite(out)
     assert np.all(out[finite] >= -1e-12)
     assert np.all(out[finite] <= 1.0 + 1e-12)
+
+
+@needs_spherely
+def test_s2_cell_areas_are_not_complements():
+    """Each s2 cell polygon must be the cell itself, not its hemisphere-sized
+    complement. A descending-coordinate winding bug balloons every cell to
+    ~4*pi sr; here a near-global grid's cell areas must each be < 2*pi and tile
+    the sphere (~4*pi total) for BOTH ascending and descending latitude."""
+    lon = np.linspace(-179, 179, 120)
+    for lat in (np.linspace(-89, 89, 90), np.linspace(89, -89, 90)):
+        grid = _build_s2_grid(lon, lat)
+        cell_areas = np.asarray(spherely.area(grid.s2_polys, radius=1.0))
+        assert np.all(cell_areas < 2 * np.pi), "a cell came out as its complement"
+        np.testing.assert_allclose(cell_areas.sum(), 4 * np.pi, rtol=0.02)
+
+
+@needs_spherely
+def test_s2_descending_latitude_matches_ascending():
+    """s2 regridding must be invariant to coordinate direction: a non-constant
+    field on a descending-latitude grid (the CF 90 -> -90 convention) must
+    regrid to the same result as the ascending grid. A clockwise/complement
+    winding bug diverges wildly here while leaving the constant-field and
+    mass-identity tests green."""
+    asc = _latlon_da(ny=30, nx=40, lat_max=80, lon_max=170, seed=3)
+    target = _latlon_target(ny=12, nx=20, lat_max=65)
+    out_asc = _s2_regridder(asc, target).regrid(asc)
+    desc = asc.isel(latitude=slice(None, None, -1))  # same field, descending lat
+    out_desc = _s2_regridder(desc, target).regrid(desc)
+    np.testing.assert_allclose(
+        out_asc.transpose(*out_desc.dims).values,
+        out_desc.values,
+        rtol=1e-9,
+        atol=1e-9,
+        equal_nan=True,
+    )

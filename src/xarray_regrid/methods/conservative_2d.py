@@ -982,15 +982,25 @@ def _build_s2_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
 def _s2_cell_polys(lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray) -> np.ndarray:
     """Build an (n_cells,) object array of spherely.Geography polygons.
 
-    Each polygon uses explicit CCW vertex order in (lon, lat) degrees and
-    ``oriented=True`` so orientation is unambiguous for cells that touch the
-    poles or span wide longitude ranges.
+    Each cell's corners are taken as ``(min, max)`` of its lon/lat edge pair, so
+    the ring is counter-clockwise in (lon, lat) **regardless of whether the
+    source lat/lon run ascending or descending** (the CF ``90 → -90`` latitude
+    convention is descending). ``spherely.create_polygon(..., oriented=True)``
+    trusts the winding: a clockwise ring would be read as the cell's
+    hemisphere-sized *complement*, silently corrupting every weight. Edges are
+    monotonic and contiguous after longitude unwrapping, so no single cell
+    straddles the antimeridian and the per-axis ``min/max`` is exact. Row-major
+    ``(y, x)`` order matches the planar shadow from :func:`_rect_grid_from_edges`.
     """
+    xlo = np.minimum(lon_edges_deg[:-1], lon_edges_deg[1:])
+    xhi = np.maximum(lon_edges_deg[:-1], lon_edges_deg[1:])
+    ylo = np.minimum(lat_edges_deg[:-1], lat_edges_deg[1:])
+    yhi = np.maximum(lat_edges_deg[:-1], lat_edges_deg[1:])
     if hasattr(spherely, "polygons"):
         # Vectorized constructor (benbovy/spherely#52, not yet released). When
         # it lands we build shells as (n, 4, 2) and skip the Python loop.
-        x0, y0 = np.meshgrid(lon_edges_deg[:-1], lat_edges_deg[:-1], indexing="xy")
-        x1, y1 = np.meshgrid(lon_edges_deg[1:], lat_edges_deg[1:], indexing="xy")
+        x0, y0 = np.meshgrid(xlo, ylo, indexing="xy")
+        x1, y1 = np.meshgrid(xhi, yhi, indexing="xy")
         shells = np.stack(
             [
                 np.stack([x0, y0], axis=-1),
@@ -1004,13 +1014,13 @@ def _s2_cell_polys(lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray) -> np.n
     # Per-cell fallback: `spherely.create_polygon` wants an iterable of tuples,
     # and a Python loop over pre-slicing an ndarray is slower than building
     # the tuple list inline.
-    nx = lon_edges_deg.size - 1
-    ny = lat_edges_deg.size - 1
+    nx = xlo.size
+    ny = ylo.size
     polys = np.empty(ny * nx, dtype=object)
     for j in range(ny):
-        y0f, y1f = float(lat_edges_deg[j]), float(lat_edges_deg[j + 1])
+        y0f, y1f = float(ylo[j]), float(yhi[j])
         for i in range(nx):
-            x0f, x1f = float(lon_edges_deg[i]), float(lon_edges_deg[i + 1])
+            x0f, x1f = float(xlo[i]), float(xhi[i])
             shell = [(x0f, y0f), (x1f, y0f), (x1f, y1f), (x0f, y1f)]
             polys[j * nx + i] = spherely.create_polygon(shell, oriented=True)
     return polys
@@ -1049,10 +1059,12 @@ class _Grid:
     ``s2_polys`` is an optional (n_cells,) object array of spherely Geography
     polygons (great-circle cells on the sphere). It is ``None`` for the planar
     and cea manifolds; for ``manifold="s2"`` it carries the spherely cells
-    while ``polys``/``bounds`` hold the planar shadow used only as the STRtree
+    while ``polys``/``bounds`` hold the planar shadow used as the STRtree
     candidate-pair bbox filter. When both the source and target grids carry
     ``s2_polys`` the weight builder uses spherely great-circle intersection
-    instead of the planar/analytic paths.
+    instead of the planar/analytic paths. Note the planar bbox does not bound a
+    great-circle cell's poleward bulge — see the limitation in
+    :func:`_build_intersection_areas`.
     """
 
     polys: np.ndarray
@@ -1116,15 +1128,24 @@ def _build_intersection_areas(
     This is the unnormalized matrix. Row-normalize via :func:`_row_normalize`
     to get forward weights; transpose first for backward (target → source).
 
-    The candidate ``(dst, src)`` cell pairs always come from a planar STRtree
-    query on ``.polys``/``.bounds`` (spherely has no spatial index), but the
-    areas themselves are computed by one of three dispatch paths:
+    The candidate ``(dst, src)`` cell pairs come from a planar STRtree query on
+    ``.polys``/``.bounds`` (spherely has no spatial index), and the areas
+    themselves are computed by one of three dispatch paths:
 
       1. both grids carry ``s2_polys`` → great-circle areas in steradians via
          :func:`_s2_intersection_areas` (``spherely`` on the unit sphere);
       2. else both grids rectilinear → analytic axis-aligned box-overlap from
          the bounds, skipping GEOS clipping;
       3. else → GEOS polygon intersection via :func:`_intersection_areas_threaded`.
+
+    KNOWN LIMITATION (s2): a planar lon/lat bbox is a conservative superset of a
+    *planar* cell but NOT of a *great-circle* cell — geodesic edges bulge
+    poleward and the bbox does not span the antimeridian seam. So for ``s2`` the
+    bbox STRtree can miss genuinely-overlapping pairs at high latitude or across
+    the dateline, leaking a little mass there (covered cells stay correct under
+    row-normalization). A bbox-inflation / spherical-cap candidate search is a
+    follow-up; until then s2 is best treated as experimental for global,
+    near-pole, or seam-crossing grids.
 
     ``predicate_filter=False`` (default) uses a bbox-only STRtree query and
     relies on the ``area > 0`` filter below to drop bbox-false-positives.
@@ -1235,17 +1256,15 @@ def _s2_intersection_areas(
 ) -> np.ndarray:
     """Per-pair great-circle intersection areas in steradians.
 
-    ``spherely.intersection`` and ``spherely.area`` are both vectorized ufuncs
-    so the serial path is a single pass through each. ``radius=1.0`` gives the
-    result on the unit sphere — fine for row-normalized weights because the
-    Earth radius would cancel through the normalization anyway.
+    ``spherely.intersection`` and ``spherely.area`` are vectorized ufuncs, so
+    each path is a single pass. ``radius=1.0`` gives areas on the unit sphere —
+    fine for row-normalized weights, where the Earth radius cancels out.
 
-    Spherely releases the GIL during the s2 boolean op (on versions that ship
-    the gil_scoped_release patch), so chunking the pair array across a
-    ThreadPoolExecutor parallelises the heavy intersection step at near-
-    linear scaling up to ~4 cores. Falls back to serial on older spherely,
-    or when ``n_threads<=1`` or the workload is too small to amortise the
-    pool overhead.
+    Above ~50k candidate pairs the work is chunked across a ThreadPoolExecutor.
+    Recent spherely releases the GIL inside the s2 boolean op, so this scales to
+    ~4 cores; on a build that does not release the GIL it still runs correctly,
+    just without the speedup (the spherely version is not detected). Serial when
+    ``n_threads <= 1`` or the workload is small.
     """
     _check_spherely()
     n = len(dst_geog)
