@@ -849,3 +849,80 @@ def test_s2_descending_latitude_matches_ascending():
         atol=1e-9,
         equal_nan=True,
     )
+
+
+def _s2_all_pairs_target_areas(da, target):
+    """Brute-force per-target-cell coverage: intersect EVERY (dst, src) s2 cell
+    pair with spherely (no STRtree). Independent ground truth for the candidate
+    search — if the STRtree drops a real overlap, the regridder's target_areas
+    fall short of this reference."""
+    sgrid = _build_s2_grid(
+        np.asarray(da.longitude.values), np.asarray(da.latitude.values)
+    )
+    dgrid = _build_s2_grid(
+        np.asarray(target.longitude.values), np.asarray(target.latitude.values)
+    )
+    ns, nd = len(sgrid.s2_polys), len(dgrid.s2_polys)
+    dst_i, src_i = np.meshgrid(np.arange(nd), np.arange(ns), indexing="ij")
+    inter = spherely.intersection(
+        dgrid.s2_polys[dst_i.ravel()], sgrid.s2_polys[src_i.ravel()]
+    )
+    return np.asarray(spherely.area(inter, radius=1.0)).reshape(nd, ns).sum(axis=1)
+
+
+@needs_spherely
+def test_s2_high_latitude_coverage_is_complete():
+    """Great-circle cell edges bulge poleward past their planar bbox, so a naive
+    bbox candidate filter drops real high-latitude overlaps. The bulge-faithful
+    shadow must recover them: target coverage matches the all-pairs reference."""
+    rng = np.random.default_rng(0)
+    da = xr.DataArray(
+        rng.normal(size=(14, 18)),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": np.linspace(60, 86, 14),  # coarse + high latitude
+            "longitude": np.linspace(-170, 170, 18),
+        },
+    )
+    target = xr.Dataset(
+        coords={
+            "latitude": np.linspace(62, 84, 8),
+            "longitude": np.linspace(-160, 160, 12),
+        }
+    )
+    rgr = ConservativeRegridder(
+        da, target, x_coord="longitude", y_coord="latitude", manifold="s2"
+    )
+    got = np.ravel(rgr.areas.sum(axis=1).todense())
+    np.testing.assert_allclose(
+        got, _s2_all_pairs_target_areas(da, target), rtol=1e-9, atol=1e-12
+    )
+
+
+@needs_spherely
+def test_s2_antimeridian_coverage_is_complete():
+    """Cells adjacent across the antimeridian genuinely overlap on the sphere
+    but have far-apart planar bboxes. The ±360° candidate query must pair them:
+    target coverage matches the all-pairs reference for a global grid."""
+    rng = np.random.default_rng(1)
+    da = xr.DataArray(
+        rng.normal(size=(30, 60)),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": np.linspace(-87, 87, 30),
+            "longitude": np.linspace(-177, 177, 60),
+        },
+    )
+    target = xr.Dataset(
+        coords={
+            "latitude": np.linspace(-80, 80, 16),
+            "longitude": np.linspace(-174, 180, 30),  # last cell straddles ±180
+        }
+    )
+    rgr = ConservativeRegridder(
+        da, target, x_coord="longitude", y_coord="latitude", manifold="s2"
+    )
+    got = np.ravel(rgr.areas.sum(axis=1).todense())
+    np.testing.assert_allclose(
+        got, _s2_all_pairs_target_areas(da, target), rtol=1e-9, atol=1e-12
+    )

@@ -20,12 +20,13 @@ stored as ``sparse.COO``; otherwise a dense numpy matrix is used.
 import math
 import os
 import warnings
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import numpy as np
 import scipy.sparse as sp
@@ -186,9 +187,10 @@ class ConservativeRegridder:
             y_coord=y_coord,
             manifold=manifold,
         )
-        src_grid = _grid_from_coords(source_grid, x_coord, y_coord, src_dims, manifold)
-        dst_grid = _grid_from_coords(target_grid, x_coord, y_coord, dst_dims, manifold)
-        areas = _build_intersection_areas(src_grid, dst_grid, n_threads=n_threads)
+        backend = _BACKENDS[manifold]
+        src_grid = backend.grid_from_coords(source_grid, x_coord, y_coord, src_dims)
+        dst_grid = backend.grid_from_coords(target_grid, x_coord, y_coord, dst_dims)
+        areas = backend.area_matrix(src_grid, dst_grid, n_threads=n_threads)
         if src_x_sort_idx is not None:
             x_dim_index = src_dims.index(source[x_coord].dims[0])
             areas = _remap_columns_for_axis_sort(
@@ -461,7 +463,7 @@ class ConservativeRegridder:
             else xr.Dataset(coords={target_dim: np.arange(n_dst)})
         )
         return cls._from_state(
-            areas=_build_intersection_areas(
+            areas=_BACKENDS["planar"].area_matrix(
                 src_grid,
                 dst_grid,
                 n_threads=n_threads,
@@ -493,23 +495,15 @@ def polygons_from_coords(
     projects 1D lat/lon (degrees) into Lambert cylindrical equal-area space;
     ``periodic=True`` unwraps antimeridian-crossing cells."""
     _check_shapely()
-    if manifold == "s2":
-        msg = (
-            "polygons_from_coords supports manifold 'planar' or 'cea'; "
-            "for s2 use ConservativeRegridder(..., manifold='s2') directly."
-        )
+    if manifold not in _BACKENDS:
+        valid = ", ".join(repr(m) for m in sorted(_BACKENDS))
+        msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
         raise ValueError(msg)
-    _check_manifold(manifold)
     x = np.asarray(x)
     y = np.asarray(y)
     if periodic:
         x = _unwrap_longitude(x)
-    if manifold == "cea":
-        if x.ndim != 1 or y.ndim != 1:
-            msg = 'manifold="cea" requires 1D lat/lon arrays'
-            raise ValueError(msg)
-        return _build_cea_grid(x, y).polys
-    return _build_grid(x, y).polys
+    return _BACKENDS[manifold].polys_from_arrays(x, y)
 
 
 def _apply_stored_weights(
@@ -850,92 +844,228 @@ def _spatial_dims(
     return tuple(d for d in obj.dims if d in dims)
 
 
-def _grid_from_coords(
-    obj: xr.DataArray | xr.Dataset,
-    x_coord: str,
-    y_coord: str,
-    dims: tuple[Hashable, ...],
-    manifold: Manifold = "planar",
-) -> "_Grid":
-    """Build a :class:`_Grid` from the object's x/y coordinates, dispatched
-    by ``manifold`` via :data:`_GRID_BUILDERS`."""
-    return _GRID_BUILDERS[manifold](obj, x_coord, y_coord, dims)
+class GeometryBackend(ABC):
+    """Per-manifold geometry strategy: how a grid's cells are built, how
+    candidate ``(dst, src)`` overlap pairs are found, and how their intersection
+    areas are computed.
+
+    Bundling all three per manifold keeps the candidate search consistent with
+    the coordinate system the cells actually live in: a planar lon/lat bbox
+    filter is only sound for cells that *are* planar boxes, so each manifold
+    owns a candidate search valid for its own geometry rather than sharing one
+    assumption. A new manifold is one new subclass + one registry entry.
+    """
+
+    name: ClassVar[str]
+
+    def check_deps(self) -> None:
+        """Raise if an optional dependency for this manifold is missing."""
+
+    @abstractmethod
+    def grid_from_coords(
+        self,
+        obj: xr.DataArray | xr.Dataset,
+        x_coord: str,
+        y_coord: str,
+        dims: tuple[Hashable, ...],
+    ) -> "_Grid":
+        """Build the cell geometry from the object's x/y coordinates."""
+
+    @abstractmethod
+    def polys_from_arrays(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Row-major ``(y, x)`` shapely cell polys for ``polygons_from_coords``."""
+
+    @abstractmethod
+    def area_matrix(
+        self,
+        src: "_Grid",
+        dst: "_Grid",
+        n_threads: int | None = None,
+        *,
+        predicate_filter: bool = False,
+    ) -> "sparse.COO | np.ndarray":
+        """Unnormalized ``(n_dst, n_src)`` area-intersection matrix
+        ``A[i, j] = area(dst_i ∩ src_j)``."""
 
 
-def _build_planar_from_coords(
-    obj: xr.DataArray | xr.Dataset,
-    x_coord: str,
-    y_coord: str,
-    dims: tuple[Hashable, ...],
-) -> "_Grid":
-    """Planar shapely polygons. Rectilinear (both coords 1D on separate dims)
-    takes the fast path; curvilinear coords are broadcast to a common N-D
-    array in ``dims`` order."""
-    xd = obj[x_coord]
-    yd = obj[y_coord]
-    if _is_rectilinear_pair(xd, yd):
-        return _build_grid(np.asarray(xd.values), np.asarray(yd.values))
-    xc, yc = xr.broadcast(xd, yd)
-    return _build_grid(
-        np.asarray(xc.transpose(*dims).values),
-        np.asarray(yc.transpose(*dims).values),
-    )
+class PlanarBackend(GeometryBackend):
+    """Raw shapely geometry in the user's coordinate space. Rectilinear grids
+    take the analytic axis-aligned box-overlap fast path; curvilinear and
+    arbitrary-polygon grids go through GEOS clipping. Also serves the
+    ``from_polygons`` path."""
+
+    name = "planar"
+
+    def grid_from_coords(
+        self,
+        obj: xr.DataArray | xr.Dataset,
+        x_coord: str,
+        y_coord: str,
+        dims: tuple[Hashable, ...],
+    ) -> "_Grid":
+        xd = obj[x_coord]
+        yd = obj[y_coord]
+        if _is_rectilinear_pair(xd, yd):
+            return _build_grid(np.asarray(xd.values), np.asarray(yd.values))
+        xc, yc = xr.broadcast(xd, yd)
+        return _build_grid(
+            np.asarray(xc.transpose(*dims).values),
+            np.asarray(yc.transpose(*dims).values),
+        )
+
+    def polys_from_arrays(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return _build_grid(x, y).polys
+
+    def area_matrix(
+        self,
+        src: "_Grid",
+        dst: "_Grid",
+        n_threads: int | None = None,
+        *,
+        predicate_filter: bool = False,
+    ) -> "sparse.COO | np.ndarray":
+        n_dst = len(dst.polys)
+        n_src = len(src.polys)
+        dst_idx, src_idx = _bbox_candidate_pairs(src.polys, dst.polys, predicate_filter)
+        if dst_idx.size == 0:
+            return _empty_weights(n_dst, n_src)
+        if src.rectilinear and dst.rectilinear:
+            areas = _analytic_box_areas(src.bounds[src_idx], dst.bounds[dst_idx])
+        else:
+            areas = _intersection_areas_threaded(
+                dst.polys[dst_idx], src.polys[src_idx], n_threads=n_threads
+            )
+        return _assemble_area_matrix(dst_idx, src_idx, areas, n_dst, n_src)
 
 
-def _build_cea_from_coords(
-    obj: xr.DataArray | xr.Dataset,
-    x_coord: str,
-    y_coord: str,
-    dims: tuple[Hashable, ...],  # noqa: ARG001 — dispatched signature
-) -> "_Grid":
-    """Lambert cylindrical equal-area polygons from 1D rectilinear lat/lon
-    centers (degrees). Cells are projected (x' = lon_rad, y' = sin(lat_rad))
-    before construction, giving mass-conservative weights on the sphere at
-    the same cost as the planar fast path. Rectilinear-only."""
-    xd = obj[x_coord]
-    yd = obj[y_coord]
-    if not _is_rectilinear_pair(xd, yd):
-        msg = 'manifold="cea" is only supported for rectilinear (1D lat/lon) coords'
-        raise NotImplementedError(msg)
-    return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
+class CeaBackend(PlanarBackend):
+    """Lambert cylindrical equal-area: 1D rectilinear lat/lon (degrees) are
+    projected to ``(lon_rad, sin(lat_rad))`` before building cells, giving
+    mass-conservative weights on the sphere at the planar fast path's cost.
+    Cells are axis-aligned boxes in projected space, so the candidate search
+    and intersection reuse :class:`PlanarBackend`. Rectilinear-only."""
+
+    name = "cea"
+
+    def grid_from_coords(
+        self,
+        obj: xr.DataArray | xr.Dataset,
+        x_coord: str,
+        y_coord: str,
+        dims: tuple[Hashable, ...],  # noqa: ARG002 — dispatched signature
+    ) -> "_Grid":
+        xd = obj[x_coord]
+        yd = obj[y_coord]
+        if not _is_rectilinear_pair(xd, yd):
+            msg = 'manifold="cea" is only supported for rectilinear (1D lat/lon) coords'
+            raise NotImplementedError(msg)
+        return _build_cea_grid(np.asarray(xd.values), np.asarray(yd.values))
+
+    def polys_from_arrays(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        if x.ndim != 1 or y.ndim != 1:
+            msg = 'manifold="cea" requires 1D lat/lon arrays'
+            raise ValueError(msg)
+        return _build_cea_grid(x, y).polys
 
 
-def _build_s2_from_coords(
-    obj: xr.DataArray | xr.Dataset,
-    x_coord: str,
-    y_coord: str,
-    dims: tuple[Hashable, ...],  # noqa: ARG001 — dispatched signature
-) -> "_Grid":
-    """Great-circle cell polygons on the sphere from 1D rectilinear lat/lon
-    centers (degrees), via the optional ``spherely`` package (s2geometry).
-    The returned grid carries spherely Geographies in ``s2_polys`` alongside a
-    planar shapely shadow used only as the STRtree candidate-pair bbox filter.
+class S2Backend(GeometryBackend):
+    """True great-circle geometry on the sphere via the optional ``spherely``
+    package (s2geometry). Cells carry spherely Geographies in ``s2_polys`` and
+    intersection areas are exact great-circle steradians. The candidate search
+    is s2-specific — a bulge-faithful planar shadow plus antimeridian-seam
+    handling — because a planar lon/lat bbox does not bound a great-circle cell.
     Rectilinear-only."""
-    xd = obj[x_coord]
-    yd = obj[y_coord]
-    if not _is_rectilinear_pair(xd, yd):
-        msg = 'manifold="s2" is only supported for rectilinear (1D lat/lon) coords'
-        raise NotImplementedError(msg)
-    return _build_s2_grid(np.asarray(xd.values), np.asarray(yd.values))
+
+    name = "s2"
+
+    def check_deps(self) -> None:
+        _check_spherely()
+
+    def grid_from_coords(
+        self,
+        obj: xr.DataArray | xr.Dataset,
+        x_coord: str,
+        y_coord: str,
+        dims: tuple[Hashable, ...],  # noqa: ARG002 — dispatched signature
+    ) -> "_Grid":
+        xd = obj[x_coord]
+        yd = obj[y_coord]
+        if not _is_rectilinear_pair(xd, yd):
+            msg = 'manifold="s2" is only supported for rectilinear (1D lat/lon) coords'
+            raise NotImplementedError(msg)
+        return _build_s2_grid(np.asarray(xd.values), np.asarray(yd.values))
+
+    def polys_from_arrays(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:  # noqa: ARG002
+        msg = (
+            "polygons_from_coords supports manifold 'planar' or 'cea'; for s2 "
+            "use ConservativeRegridder(..., manifold='s2') directly."
+        )
+        raise ValueError(msg)
+
+    def area_matrix(
+        self,
+        src: "_Grid",
+        dst: "_Grid",
+        n_threads: int | None = None,
+        *,
+        predicate_filter: bool = False,  # noqa: ARG002 — s2 uses its own search
+    ) -> "sparse.COO | np.ndarray":
+        s2_src = cast("np.ndarray", src.s2_polys)
+        s2_dst = cast("np.ndarray", dst.s2_polys)
+        n_dst = len(s2_dst)
+        n_src = len(s2_src)
+        dst_idx, src_idx = self._candidate_pairs(src, dst)
+        if dst_idx.size == 0:
+            return _empty_weights(n_dst, n_src)
+        areas = _s2_intersection_areas(
+            s2_dst[dst_idx], s2_src[src_idx], n_threads=n_threads
+        )
+        return _assemble_area_matrix(dst_idx, src_idx, areas, n_dst, n_src)
+
+    @staticmethod
+    def _candidate_pairs(src: "_Grid", dst: "_Grid") -> tuple[np.ndarray, np.ndarray]:
+        """Candidate (dst, src) pairs from the bulge-faithful planar shadow,
+        querying the dst boxes shifted by 0 / ±360° in longitude so cells
+        adjacent across the antimeridian are paired — spherely then computes
+        their true great-circle overlap (and the ``area > 0`` filter drops the
+        rest). With the faithful shadow already bounding each cell's poleward
+        bulge, this candidate set is a conservative superset on the sphere."""
+        _check_shapely()
+        tree = STRtree(np.asarray(src.polys))
+        db = dst.bounds
+        parts_d, parts_s = [], []
+        for shift in (0.0, 360.0, -360.0):
+            q = (
+                dst.polys
+                if shift == 0.0
+                else shapely.box(db[:, 0] + shift, db[:, 1], db[:, 2] + shift, db[:, 3])
+            )
+            pairs = tree.query(np.asarray(q))
+            parts_d.append(np.asarray(pairs[0]))
+            parts_s.append(np.asarray(pairs[1]))
+        dst_idx = np.concatenate(parts_d)
+        src_idx = np.concatenate(parts_s)
+        if dst_idx.size:
+            n_src = len(src.polys)
+            flat = dst_idx.astype(np.int64) * n_src + src_idx.astype(np.int64)
+            _, uniq = np.unique(flat, return_index=True)
+            dst_idx, src_idx = dst_idx[uniq], src_idx[uniq]
+        return dst_idx, src_idx
 
 
-# Registry of geometry backends. Each builder takes the same
-# ``(obj, x_coord, y_coord, dims)`` and returns a ``_Grid``. New manifolds
-# plug in via a single insert.
-_GRID_BUILDERS: dict[str, Callable[..., "_Grid"]] = {
-    "planar": _build_planar_from_coords,
-    "cea": _build_cea_from_coords,
-    "s2": _build_s2_from_coords,
+# Manifold registry. Each backend owns its grid construction, candidate-pair
+# search, and intersection kernel; new manifolds plug in via a single insert.
+_BACKENDS: dict[str, GeometryBackend] = {
+    b.name: b for b in (PlanarBackend(), CeaBackend(), S2Backend())
 }
 
 
 def _check_manifold(manifold: str) -> None:
-    if manifold not in _GRID_BUILDERS:
-        valid = ", ".join(repr(m) for m in sorted(_GRID_BUILDERS))
+    if manifold not in _BACKENDS:
+        valid = ", ".join(repr(m) for m in sorted(_BACKENDS))
         msg = f"manifold must be one of {{{valid}}}; got {manifold!r}"
         raise ValueError(msg)
-    if manifold == "s2":
-        _check_spherely()
+    _BACKENDS[manifold].check_deps()
 
 
 def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
@@ -961,8 +1091,11 @@ def _build_cea_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid"
 
 def _build_s2_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
     """Rectilinear _Grid carrying spherely great-circle cell polygons in
-    ``s2_polys`` (plus planar shapely polys/bounds, used only as the STRtree
-    candidate-pair bbox filter since spherely has no spatial index)."""
+    ``s2_polys``, plus a planar shapely shadow (``polys``/``bounds``) used by
+    :meth:`S2Backend._candidate_pairs` as the STRtree candidate filter (spherely
+    has no spatial index). The shadow's latitude bounds are extended to each
+    cell's great-circle apex so the bbox is a conservative superset of the s2
+    cell — see :func:`_s2_shadow_boxes`."""
     _check_shapely()
     _check_spherely()
     if lon_centers.size < 2 or lat_centers.size < 2:
@@ -970,13 +1103,52 @@ def _build_s2_grid(lon_centers: np.ndarray, lat_centers: np.ndarray) -> "_Grid":
         raise ValueError(msg)
     lon_edges_deg = utils.infer_1d_edges(lon_centers)
     lat_edges_deg = np.clip(utils.infer_1d_edges(lat_centers), -90.0, 90.0)
-    planar = _rect_grid_from_edges(lon_edges_deg, lat_edges_deg)
+    shadow_polys, shadow_bounds = _s2_shadow_boxes(lon_edges_deg, lat_edges_deg)
     return _Grid(
-        polys=planar.polys,
-        bounds=planar.bounds,
+        polys=shadow_polys,
+        bounds=shadow_bounds,
         rectilinear=True,
         s2_polys=_s2_cell_polys(lon_edges_deg, lat_edges_deg),
     )
+
+
+def _s2_shadow_boxes(
+    lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Planar shadow boxes that are a conservative superset of the s2 cells.
+
+    A constant-latitude cell edge is *not* a great circle: its geodesic bows
+    poleward, reaching a maximum latitude (the apex)
+
+        apex(phi, dlon) = sign(phi) * atan( |tan(phi)| / cos(dlon / 2) )
+
+    so a planar ``[lat0, lat1]`` box under-bounds the cell and the STRtree could
+    drop a genuinely-overlapping pair. We extend each cell's poleward latitude
+    bound to that apex (longitude edges are meridians — themselves great circles
+    — so they do not bulge). The resulting bbox bounds the cell, making the
+    candidate search lossless. Returns row-major ``(y, x)`` polys + bounds.
+    """
+    xlo = np.minimum(lon_edges_deg[:-1], lon_edges_deg[1:])  # (nx,)
+    xhi = np.maximum(lon_edges_deg[:-1], lon_edges_deg[1:])
+    ylo = np.minimum(lat_edges_deg[:-1], lat_edges_deg[1:])  # (ny,)
+    yhi = np.maximum(lat_edges_deg[:-1], lat_edges_deg[1:])
+    dlon = np.abs(lon_edges_deg[1:] - lon_edges_deg[:-1])  # (nx,) cell widths
+    cos_half = np.cos(np.deg2rad(dlon) / 2.0)  # (nx,); <= 0 once dlon >= 180
+
+    def apex(lat_deg: np.ndarray) -> np.ndarray:  # (ny,) -> (ny, nx)
+        phi = np.deg2rad(lat_deg)[:, None]
+        # arctan2 keeps cos_half <= 0 finite; sign(phi) zeroes the equator edge.
+        mag = np.arctan2(np.abs(np.tan(phi)), cos_half[None, :])
+        return np.rad2deg(np.sign(phi) * mag)
+
+    lat_lo = np.clip(np.minimum(ylo[:, None], apex(ylo)), -90.0, 90.0)  # (ny, nx)
+    lat_hi = np.clip(np.maximum(yhi[:, None], apex(yhi)), -90.0, 90.0)
+    lon_lo = np.broadcast_to(xlo[None, :], lat_lo.shape).ravel()
+    lon_hi = np.broadcast_to(xhi[None, :], lat_hi.shape).ravel()
+    y0f, y1f = lat_lo.ravel(), lat_hi.ravel()
+    polys = shapely.box(lon_lo, y0f, lon_hi, y1f)
+    bounds = np.stack([lon_lo, y0f, lon_hi, y1f], axis=1)
+    return polys, bounds
 
 
 def _s2_cell_polys(lon_edges_deg: np.ndarray, lat_edges_deg: np.ndarray) -> np.ndarray:
@@ -1047,24 +1219,22 @@ def _infer_2d_corners(a: np.ndarray) -> np.ndarray:
 
 @dataclass
 class _Grid:
-    """Cached cell geometry for a structured grid.
+    """Cached cell geometry consumed by a :class:`GeometryBackend`.
 
-    ``polys`` is a flat (n_cells,) object array of shapely Polygons.
-    ``bounds`` is a (n_cells, 4) ``(minx, miny, maxx, maxy)`` array cached for
-    the STRtree / candidate-search path. ``rectilinear`` is True when both the
+    ``polys`` is a flat (n_cells,) object array of shapely Polygons used by the
+    STRtree candidate-pair search. ``bounds`` is the matching (n_cells, 4)
+    ``(minx, miny, maxx, maxy)`` array. ``rectilinear`` is True when both the
     source x and y were 1D coordinate arrays (axis-aligned rectangles) — the
-    weight builder uses this to skip GEOS polygon clipping and compute
-    intersection areas analytically from the bounds.
+    :class:`PlanarBackend` uses this to compute intersection areas analytically
+    from the bounds instead of via GEOS clipping.
 
     ``s2_polys`` is an optional (n_cells,) object array of spherely Geography
-    polygons (great-circle cells on the sphere). It is ``None`` for the planar
-    and cea manifolds; for ``manifold="s2"`` it carries the spherely cells
-    while ``polys``/``bounds`` hold the planar shadow used as the STRtree
-    candidate-pair bbox filter. When both the source and target grids carry
-    ``s2_polys`` the weight builder uses spherely great-circle intersection
-    instead of the planar/analytic paths. Note the planar bbox does not bound a
-    great-circle cell's poleward bulge — see the limitation in
-    :func:`_build_intersection_areas`.
+    polygons (great-circle cells on the sphere), set only for ``manifold="s2"``.
+    There ``polys``/``bounds`` hold the *bulge-faithful* planar shadow (its
+    latitude bounds reach each cell's great-circle apex, see
+    :func:`_s2_shadow_boxes`) so the STRtree candidate set is a conservative
+    superset of the s2 cells; :class:`S2Backend` computes the actual areas from
+    ``s2_polys`` via spherely.
     """
 
     polys: np.ndarray
@@ -1115,82 +1285,54 @@ def _build_grid(xc: np.ndarray, yc: np.ndarray) -> _Grid:
     raise ValueError(msg)
 
 
-def _build_intersection_areas(
-    src: _Grid,
-    dst: _Grid,
-    n_threads: int | None = None,
-    *,
-    predicate_filter: bool = False,
-) -> "sparse.COO | np.ndarray":
-    """Build the (n_dst, n_src) raw area-intersection matrix ``A[i, j] =
-    area(dst_i ∩ src_j)``.
+def _bbox_candidate_pairs(
+    src_polys: np.ndarray, dst_polys: np.ndarray, predicate_filter: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Candidate ``(dst, src)`` cell pairs from a planar STRtree bbox query.
 
-    This is the unnormalized matrix. Row-normalize via :func:`_row_normalize`
-    to get forward weights; transpose first for backward (target → source).
-
-    The candidate ``(dst, src)`` cell pairs come from a planar STRtree query on
-    ``.polys``/``.bounds`` (spherely has no spatial index), and the areas
-    themselves are computed by one of three dispatch paths:
-
-      1. both grids carry ``s2_polys`` → great-circle areas in steradians via
-         :func:`_s2_intersection_areas` (``spherely`` on the unit sphere);
-      2. else both grids rectilinear → analytic axis-aligned box-overlap from
-         the bounds, skipping GEOS clipping;
-      3. else → GEOS polygon intersection via :func:`_intersection_areas_threaded`.
-
-    KNOWN LIMITATION (s2): a planar lon/lat bbox is a conservative superset of a
-    *planar* cell but NOT of a *great-circle* cell — geodesic edges bulge
-    poleward and the bbox does not span the antimeridian seam. So for ``s2`` the
-    bbox STRtree can miss genuinely-overlapping pairs at high latitude or across
-    the dateline, leaking a little mass there (covered cells stay correct under
-    row-normalization). A bbox-inflation / spherical-cap candidate search is a
-    follow-up; until then s2 is best treated as experimental for global,
-    near-pole, or seam-crossing grids.
-
-    ``predicate_filter=False`` (default) uses a bbox-only STRtree query and
-    relies on the ``area > 0`` filter below to drop bbox-false-positives.
-    For structured cells whose bboxes are tight (quadrilaterals) this is a
-    large win — the GEOS ``intersects`` predicate inside STRtree is much
-    more expensive than the extra no-op intersections it avoids. Set
-    ``predicate_filter=True`` for user-supplied polygons with loose bboxes
-    (long, thin, diagonal shapes) where the predicate pays for itself.
+    ``predicate_filter=False`` (default) is a bbox-only query and relies on the
+    downstream ``area > 0`` filter to drop bbox false-positives — a large win
+    for tight quad bboxes, where the GEOS ``intersects`` predicate inside
+    STRtree costs more than the no-op intersections it avoids.
+    ``predicate_filter=True`` runs the predicate, which pays off for loose
+    bboxes (long, thin diagonals).
     """
     _check_shapely()
-    n_dst = len(dst.polys)
-    n_src = len(src.polys)
-
-    tree = STRtree(src.polys)
+    tree = STRtree(np.asarray(src_polys))
     if predicate_filter:
-        pairs = tree.query(dst.polys, predicate="intersects")
+        pairs = tree.query(np.asarray(dst_polys), predicate="intersects")
     else:
-        pairs = tree.query(dst.polys)
-    dst_idx = np.asarray(pairs[0])
-    src_idx = np.asarray(pairs[1])
+        pairs = tree.query(np.asarray(dst_polys))
+    return np.asarray(pairs[0]), np.asarray(pairs[1])
 
-    if dst_idx.size == 0:
-        return _empty_weights(n_dst, n_src)
 
-    if src.s2_polys is not None and dst.s2_polys is not None:
-        areas = _s2_intersection_areas(
-            dst.s2_polys[dst_idx], src.s2_polys[src_idx], n_threads=n_threads
-        )
-    elif src.rectilinear and dst.rectilinear:
-        sb = src.bounds[src_idx]
-        db = dst.bounds[dst_idx]
-        dx = np.minimum(sb[:, 2], db[:, 2]) - np.maximum(sb[:, 0], db[:, 0])
-        dy = np.minimum(sb[:, 3], db[:, 3]) - np.maximum(sb[:, 1], db[:, 1])
-        areas = np.maximum(dx, 0.0) * np.maximum(dy, 0.0)
-    else:
-        areas = _intersection_areas_threaded(
-            dst.polys[dst_idx], src.polys[src_idx], n_threads=n_threads
-        )
+def _analytic_box_areas(src_bounds: np.ndarray, dst_bounds: np.ndarray) -> np.ndarray:
+    """Per-pair overlap area of axis-aligned boxes from their ``(minx, miny,
+    maxx, maxy)`` bounds — exact for rectilinear cells, no GEOS clipping."""
+    dx = np.minimum(src_bounds[:, 2], dst_bounds[:, 2]) - np.maximum(
+        src_bounds[:, 0], dst_bounds[:, 0]
+    )
+    dy = np.minimum(src_bounds[:, 3], dst_bounds[:, 3]) - np.maximum(
+        src_bounds[:, 1], dst_bounds[:, 1]
+    )
+    return np.maximum(dx, 0.0) * np.maximum(dy, 0.0)
 
+
+def _assemble_area_matrix(
+    dst_idx: np.ndarray,
+    src_idx: np.ndarray,
+    areas: np.ndarray,
+    n_dst: int,
+    n_src: int,
+) -> "sparse.COO | np.ndarray":
+    """Drop zero-area candidate pairs and assemble the (sparse or dense)
+    ``(n_dst, n_src)`` unnormalized area-intersection matrix. Row-normalize via
+    :func:`_row_normalize` to get forward weights; transpose first for backward
+    (target → source)."""
     keep = areas > 0
-    dst_idx = dst_idx[keep]
-    src_idx = src_idx[keep]
-    areas = areas[keep]
-
-    return _coo_or_dense(dst_idx, src_idx, areas.astype(np.float64), (n_dst, n_src))
+    return _coo_or_dense(
+        dst_idx[keep], src_idx[keep], areas[keep].astype(np.float64), (n_dst, n_src)
+    )
 
 
 def _row_normalize(

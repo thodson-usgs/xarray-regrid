@@ -7,7 +7,8 @@ from typing import Literal
 # - "cea": Lambert cylindrical equal-area projection of 1D lat/lon (degrees)
 #          — analytic spherical areas at planar cost
 # - "s2": true great-circle polygons on the sphere via the optional `spherely`
-#         package (s2geometry). Plugs in via _GRID_BUILDERS like the others.
+#         package (s2geometry). Each manifold is a GeometryBackend (see the
+#         _BACKENDS registry in conservative_2d).
 Manifold = Literal["planar", "cea", "s2"]
 
 
